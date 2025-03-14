@@ -12,6 +12,7 @@ GMeter es una herramienta de línea de comandos para realizar pruebas de stress 
 - Dependencias entre servicios
 - Extracción de tokens de respuestas
 - Generación de reportes detallados con gráficos SVG integrados
+- Sistema de logs con colores y rotación de archivos
 
 ## Instalación
 
@@ -42,6 +43,22 @@ go install github.com/KaribuLab/gmeter/cmd/gmeter@latest
 ```bash
 ./gmeter --config mi_configuracion.yaml
 ```
+
+### Opciones de línea de comandos
+
+```bash
+./gmeter --help
+```
+
+Opciones disponibles:
+
+- `--config`: Archivo de configuración (por defecto es ./gmeter.yaml)
+- `--verbose, -v`: Mostrar logs en consola (por defecto: true)
+- `--log-level`: Nivel de log (trace, debug, info, warn, error, fatal, panic) (por defecto: info)
+- `--log-max-size`: Tamaño máximo del archivo de log en MB antes de rotar (por defecto: 10)
+- `--log-max-backups`: Número máximo de archivos de respaldo (por defecto: 5)
+- `--log-max-age`: Días máximos para mantener los archivos de log (por defecto: 30)
+- `--log-compress`: Comprimir los archivos de log rotados (por defecto: true)
 
 ## Archivo de Configuración
 
@@ -84,11 +101,30 @@ services:
       Authorization: "Bearer {{.auth_token}}"
     depends_on: "auth"
 
+  - name: "update_profile"
+    url: "https://api.example.com/profile"
+    method: "PUT"
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{.auth_token}}"
+    body_template: |
+      {
+        "name": "{{.name}}",
+        "email": "{{.email}}",
+        "phone": "{{.phone}}"
+      }
+    depends_on: "auth"
+    data_source: "profiles"
+
 # Fuentes de datos
 data_sources:
   csv:
     users:
       path: "data/users.csv"
+      delimiter: ","
+      has_header: true
+    profiles:
+      path: "data/profiles.csv"
       delimiter: ","
       has_header: true
 ```
@@ -126,6 +162,21 @@ data_sources:
   - `delimiter`: Delimitador del archivo CSV
   - `has_header`: Indica si el archivo CSV tiene cabecera
 
+## Sistema de Logs
+
+GMeter incluye un sistema de logs avanzado con las siguientes características:
+
+- Logs con colores en la consola para mejor legibilidad
+- Rotación de archivos de log para evitar archivos demasiado grandes
+- Configuración de niveles de log (trace, debug, info, warn, error, fatal, panic)
+- Compresión de archivos de log rotados
+
+La configuración de logs se puede ajustar mediante parámetros de línea de comandos:
+
+```bash
+./gmeter --log-level debug --log-max-size 5 --log-max-backups 3 --log-max-age 7
+```
+
 ## Reportes
 
 GMeter genera reportes detallados en formato Markdown con gráficos SVG integrados. Los reportes incluyen:
@@ -141,6 +192,7 @@ GMeter genera reportes detallados en formato Markdown con gráficos SVG integrad
   - Códigos de estado
   - Gráfico de distribución de códigos de estado
   - Errores
+- Configuración utilizada en formato YAML
 
 Los gráficos SVG se integran directamente en el archivo Markdown, lo que permite visualizarlos fácilmente en cualquier visor de Markdown que soporte SVG, como GitHub, GitLab, o editores como Visual Studio Code.
 
