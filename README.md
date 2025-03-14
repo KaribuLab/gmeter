@@ -1,5 +1,9 @@
 # GMeter - Herramienta de Pruebas de Stress HTTP
 
+<p align="center">
+  <img src="gmeter.png" alt="GMeter Logo" width="200"/>
+</p>
+
 GMeter es una herramienta de línea de comandos para realizar pruebas de stress en servicios HTTP. Permite configurar múltiples servicios, hilos por segundo, y generar reportes detallados.
 
 ## Características
