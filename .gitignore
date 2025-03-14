@@ -1,0 +1,32 @@
+# Binarios
+/gmeter
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Archivos de prueba
+*.test
+*.out
+
+# Archivos de log
+*.log
+
+# Directorios de salida
+/reports/
+/vendor/
+
+# Archivos de configuración locales
+gmeter.yaml
+/data/*.csv
+
+# Archivos temporales
+*.tmp
+*.bak
+*.swp
+*~
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db 

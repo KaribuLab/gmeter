@@ -1,0 +1,60 @@
+# Configuración de GMeter
+log_file: "gmeter.log"
+report_dir: "reports"
+
+# Configuración global
+global:
+  threads_per_second: 10
+  duration: "1m"
+  ramp_up: "10s"
+
+# Servicios a probar
+services:
+  - name: "auth"
+    url: "https://api.example.com/auth"
+    method: "POST"
+    headers:
+      Content-Type: "application/json"
+    body_template: |
+      {
+        "username": "{{.username}}",
+        "password": "{{.password}}"
+      }
+    extract_token: "$.token"
+    token_name: "auth_token"
+    data_source: "users"
+
+  - name: "get_profile"
+    url: "https://api.example.com/profile"
+    method: "GET"
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{.auth_token}}"
+    depends_on: "auth"
+
+  - name: "update_profile"
+    url: "https://api.example.com/profile"
+    method: "PUT"
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{.auth_token}}"
+    body_template: |
+      {
+        "name": "{{.name}}",
+        "email": "{{.email}}",
+        "phone": "{{.phone}}"
+      }
+    depends_on: "auth"
+    data_source: "profiles"
+
+# Fuentes de datos
+data_sources:
+  csv:
+    users:
+      path: "data/users.csv"
+      delimiter: ","
+      has_header: true
+    profiles:
+      path: "data/profiles.csv"
+      delimiter: ","
+      has_header: true 
