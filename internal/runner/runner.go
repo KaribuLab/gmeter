@@ -74,30 +74,33 @@ func (r *Runner) Run() error {
 		return fmt.Errorf("error al parsear el tiempo de rampa: %w", err)
 	}
 
-	// Calcular el número total de hilos
-	totalThreads := r.Config.GlobalConfig.ThreadsPerSecond
-
-	// Iniciar los hilos
-	r.Logger.Infof("Iniciando %d hilos por segundo durante %s", totalThreads, duration)
-
-	// Si hay tiempo de rampa, distribuir los hilos
-	if rampUp > 0 {
-		r.Logger.Infof("Tiempo de rampa: %s", rampUp)
-
-		// Calcular el intervalo entre hilos
-		interval := rampUp / time.Duration(totalThreads)
-
-		// Iniciar los hilos gradualmente
-		for i := 0; i < totalThreads; i++ {
-			r.WaitGroup.Add(1)
-			go r.runThread(i)
-			time.Sleep(interval)
+	// Iniciar los hilos para cada servicio
+	for _, service := range r.Config.Services {
+		// Determinar el número de hilos para este servicio
+		threadsPerSecond := r.Config.GlobalConfig.ThreadsPerSecond
+		if service.ThreadsPerSecond > 0 {
+			threadsPerSecond = service.ThreadsPerSecond
 		}
-	} else {
-		// Iniciar todos los hilos a la vez
-		for i := 0; i < totalThreads; i++ {
-			r.WaitGroup.Add(1)
-			go r.runThread(i)
+
+		r.Logger.Infof("Iniciando %d hilos por segundo para el servicio %s", threadsPerSecond, service.Name)
+
+		// Si hay tiempo de rampa, distribuir los hilos
+		if rampUp > 0 {
+			// Calcular el intervalo entre hilos
+			interval := rampUp / time.Duration(threadsPerSecond)
+
+			// Iniciar los hilos gradualmente
+			for i := 0; i < threadsPerSecond; i++ {
+				r.WaitGroup.Add(1)
+				go r.runServiceThread(i, service)
+				time.Sleep(interval)
+			}
+		} else {
+			// Iniciar todos los hilos a la vez
+			for i := 0; i < threadsPerSecond; i++ {
+				r.WaitGroup.Add(1)
+				go r.runServiceThread(i, service)
+			}
 		}
 	}
 
@@ -105,7 +108,6 @@ func (r *Runner) Run() error {
 	done := make(chan struct{})
 	go func() {
 		r.WaitGroup.Wait()
-		close(r.Results)
 		close(done)
 	}()
 
@@ -117,10 +119,12 @@ func (r *Runner) Run() error {
 		r.Logger.Info("Todos los hilos han terminado")
 	}
 
-	r.EndTime = time.Now()
+	// Cerrar el canal de resultados
+	close(r.Results)
 
-	// Esperar a que se procesen todos los resultados
+	// Esperar a que termine el recolector de resultados
 	result := <-resultCollector
+	r.EndTime = time.Now()
 
 	// Generar el reporte
 	r.Logger.Info("Generando reporte")
@@ -197,94 +201,124 @@ func (r *Runner) loadDataSources() error {
 	return nil
 }
 
-// runThread ejecuta un hilo de prueba
-func (r *Runner) runThread(id int) {
+// runServiceThread ejecuta un hilo de prueba para un servicio específico
+func (r *Runner) runServiceThread(id int, service *config.Service) {
 	defer r.WaitGroup.Done()
 
-	r.Logger.Infof("Iniciando hilo %d", id)
+	r.Logger.Infof("Iniciando hilo %d para el servicio %s", id, service.Name)
 
 	// Crear el contexto del hilo
 	var threadContext *models.ThreadContext
 
-	// Ejecutar los servicios en orden
-	for _, service := range r.Config.Services {
-		// Si el servicio depende de otro, verificar que se haya ejecutado
-		if service.DependsOn != "" {
-			if threadContext == nil {
-				r.Logger.Warnf("El servicio %s depende de %s, pero no hay contexto de hilo", service.Name, service.DependsOn)
-				continue
-			}
-
-			// Buscar el servicio del que depende para obtener el nombre del token
-			var tokenName string
-			for _, s := range r.Config.Services {
-				if s.Name == service.DependsOn && s.TokenName != "" {
-					tokenName = s.TokenName
-					break
-				}
-			}
-
-			// Si no se encontró el nombre del token, usar el nombre del servicio
-			if tokenName == "" {
-				tokenName = service.DependsOn
-			}
-
-			token, exists := threadContext.TokenStore.GetToken(tokenName)
-			if !exists || token == "" {
-				r.Logger.Warnf("El servicio %s depende de %s, pero no se ha generado un token", service.Name, service.DependsOn)
-				continue
+	// Si el servicio depende de otro, verificar que se haya ejecutado
+	if service.DependsOn != "" {
+		// Buscar el servicio del que depende
+		var dependentService *config.Service
+		for _, s := range r.Config.Services {
+			if s.Name == service.DependsOn {
+				dependentService = s
+				break
 			}
 		}
 
-		// Si el servicio usa una fuente de datos, obtener un registro
-		var data models.DataRecord
-		if service.DataSourceName != "" {
-			if records, ok := r.DataSource[service.DataSourceName]; ok && len(records) > 0 {
+		if dependentService == nil {
+			r.Logger.Warnf("El servicio %s depende de %s, pero este no existe", service.Name, service.DependsOn)
+			return
+		}
+
+		// Ejecutar el servicio del que depende para obtener el token
+		tempThreadContext := models.NewThreadContext(id, nil)
+
+		// Si el servicio dependiente usa una fuente de datos, obtener un registro
+		if dependentService.DataSourceName != "" {
+			if records, ok := r.DataSource[dependentService.DataSourceName]; ok && len(records) > 0 {
 				// Seleccionar un registro basado en el ID del hilo
-				data = records[id%len(records)]
+				data := records[id%len(records)]
+				tempThreadContext.Data = data
 			} else {
-				r.Logger.Warnf("No hay datos disponibles para el servicio %s", service.Name)
-				continue
+				r.Logger.Warnf("No hay datos disponibles para el servicio %s", dependentService.Name)
+				return
 			}
 		}
 
-		// Crear el contexto del hilo si no existe
-		if threadContext == nil {
-			threadContext = models.NewThreadContext(id, data)
-		} else if data != nil {
-			// Actualizar los datos del contexto
-			for k, v := range data {
-				threadContext.Data[k] = v
-			}
-		}
-
-		// Ejecutar el servicio
-		resp, err := r.executeService(service, threadContext)
+		// Ejecutar el servicio dependiente
+		resp, err := r.executeService(dependentService, tempThreadContext)
 		if err != nil {
-			r.Logger.WithError(err).Errorf("Error al ejecutar el servicio %s", service.Name)
-			continue
+			r.Logger.WithError(err).Errorf("Error al ejecutar el servicio dependiente %s", dependentService.Name)
+			return
 		}
 
 		// Enviar el resultado
 		r.Results <- resp
 
-		// Si el servicio extrae un token, guardarlo
-		if service.ExtractToken != "" && service.TokenName != "" {
+		// Extraer el token
+		if dependentService.ExtractToken != "" && dependentService.TokenName != "" {
 			// Parsear la respuesta como JSON
 			if resp.Body != nil {
 				// Extraer el token usando gjson
-				token := gjson.GetBytes(resp.Body, service.ExtractToken).String()
+				token := gjson.GetBytes(resp.Body, dependentService.ExtractToken).String()
 				if token != "" {
-					threadContext.TokenStore.SetToken(service.TokenName, token)
-					r.Logger.Infof("Token extraído para %s: %s", service.TokenName, token)
+					tempThreadContext.TokenStore.SetToken(dependentService.TokenName, token)
+					r.Logger.Infof("Token extraído para %s: %s", dependentService.TokenName, token)
 				} else {
-					r.Logger.Warnf("No se pudo extraer el token para %s", service.TokenName)
+					r.Logger.Warnf("No se pudo extraer el token para %s", dependentService.TokenName)
+					return
 				}
+			}
+		}
+
+		// Usar el contexto del hilo temporal
+		threadContext = tempThreadContext
+	}
+
+	// Si el servicio usa una fuente de datos, obtener un registro
+	var data models.DataRecord
+	if service.DataSourceName != "" {
+		if records, ok := r.DataSource[service.DataSourceName]; ok && len(records) > 0 {
+			// Seleccionar un registro basado en el ID del hilo
+			data = records[id%len(records)]
+		} else {
+			r.Logger.Warnf("No hay datos disponibles para el servicio %s", service.Name)
+			return
+		}
+	}
+
+	// Crear el contexto del hilo si no existe
+	if threadContext == nil {
+		threadContext = models.NewThreadContext(id, data)
+	} else if data != nil {
+		// Actualizar los datos del contexto
+		for k, v := range data {
+			threadContext.Data[k] = v
+		}
+	}
+
+	// Ejecutar el servicio
+	resp, err := r.executeService(service, threadContext)
+	if err != nil {
+		r.Logger.WithError(err).Errorf("Error al ejecutar el servicio %s", service.Name)
+		return
+	}
+
+	// Enviar el resultado
+	r.Results <- resp
+
+	// Si el servicio extrae un token, guardarlo
+	if service.ExtractToken != "" && service.TokenName != "" {
+		// Parsear la respuesta como JSON
+		if resp.Body != nil {
+			// Extraer el token usando gjson
+			token := gjson.GetBytes(resp.Body, service.ExtractToken).String()
+			if token != "" {
+				threadContext.TokenStore.SetToken(service.TokenName, token)
+				r.Logger.Infof("Token extraído para %s: %s", service.TokenName, token)
+			} else {
+				r.Logger.Warnf("No se pudo extraer el token para %s", service.TokenName)
 			}
 		}
 	}
 
-	r.Logger.Infof("Hilo %d completado", id)
+	r.Logger.Infof("Hilo %d completado para el servicio %s", id, service.Name)
 }
 
 // executeService ejecuta un servicio

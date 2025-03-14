@@ -23,6 +23,7 @@ services:
     extract_token: "$.token"
     token_name: "auth_token"
     data_source: "users"
+    threads_per_second: 1  # Solo necesitamos un hilo para autenticación
 
   - name: "get_profile"
     url: "https://api.example.com/profile"
@@ -31,6 +32,7 @@ services:
       Content-Type: "application/json"
       Authorization: "Bearer {{.auth_token}}"
     depends_on: "auth"
+    threads_per_second: 5  # Usar 5 hilos por segundo para este servicio
 
   - name: "update_profile"
     url: "https://api.example.com/profile"
@@ -46,6 +48,7 @@ services:
       }
     depends_on: "auth"
     data_source: "profiles"
+    # Si no se especifica threads_per_second, se usa el valor global (10)
 
 # Fuentes de datos
 data_sources:

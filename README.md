@@ -10,7 +10,7 @@ GMeter es una herramienta de línea de comandos para realizar pruebas de stress 
 
 - Configuración mediante archivo YAML
 - Soporte para múltiples servicios HTTP
-- Control de hilos por segundo
+- Control de hilos por segundo (global y por servicio)
 - Tiempo de rampa configurable
 - Fuentes de datos CSV
 - Dependencias entre servicios
@@ -96,6 +96,7 @@ services:
     extract_token: "$.token"
     token_name: "auth_token"
     data_source: "users"
+    threads_per_second: 1  # Solo necesitamos un hilo para autenticación
 
   - name: "get_profile"
     url: "https://api.example.com/profile"
@@ -104,6 +105,7 @@ services:
       Content-Type: "application/json"
       Authorization: "Bearer {{.auth_token}}"
     depends_on: "auth"
+    threads_per_second: 5  # Usar 5 hilos por segundo para este servicio
 
   - name: "update_profile"
     url: "https://api.example.com/profile"
@@ -119,6 +121,7 @@ services:
       }
     depends_on: "auth"
     data_source: "profiles"
+    # Si no se especifica threads_per_second, se usa el valor global (10)
 
 # Fuentes de datos
 data_sources:
@@ -142,7 +145,7 @@ data_sources:
 
 #### Configuración de Ejecución
 
-- `threads_per_second`: Número de hilos por segundo
+- `threads_per_second`: Número de hilos por segundo (valor por defecto para todos los servicios)
 - `duration`: Duración total de la prueba (formato: "1h", "30m", "1m30s", etc.)
 - `ramp_up`: Tiempo de rampa para alcanzar el número total de hilos (formato: "10s", "1m", etc.)
 
@@ -158,6 +161,7 @@ data_sources:
 - `extract_token`: Expresión JSONPath para extraer un token de la respuesta
 - `token_name`: Nombre con el que se guardará el token extraído
 - `data_source`: Nombre de la fuente de datos a utilizar
+- `threads_per_second`: Número de hilos por segundo específico para este servicio (opcional, si no se especifica se usa el valor global)
 
 #### Fuentes de Datos
 

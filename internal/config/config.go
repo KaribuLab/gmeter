@@ -26,16 +26,17 @@ type RunConfig struct {
 
 // Service representa un servicio HTTP a probar
 type Service struct {
-	Name           string            `mapstructure:"name"`
-	URL            string            `mapstructure:"url"`
-	Method         string            `mapstructure:"method"`
-	Headers        map[string]string `mapstructure:"headers"`
-	Body           string            `mapstructure:"body"`
-	BodyTemplate   string            `mapstructure:"body_template"`
-	DependsOn      string            `mapstructure:"depends_on"`
-	ExtractToken   string            `mapstructure:"extract_token"`
-	TokenName      string            `mapstructure:"token_name"`
-	DataSourceName string            `mapstructure:"data_source"`
+	Name             string            `mapstructure:"name"`
+	URL              string            `mapstructure:"url"`
+	Method           string            `mapstructure:"method"`
+	Headers          map[string]string `mapstructure:"headers"`
+	Body             string            `mapstructure:"body"`
+	BodyTemplate     string            `mapstructure:"body_template"`
+	DependsOn        string            `mapstructure:"depends_on"`
+	ExtractToken     string            `mapstructure:"extract_token"`
+	TokenName        string            `mapstructure:"token_name"`
+	DataSourceName   string            `mapstructure:"data_source"`
+	ThreadsPerSecond int               `mapstructure:"threads_per_second"`
 }
 
 // DataSource representa las fuentes de datos para las pruebas
@@ -195,6 +196,7 @@ services:
     extract_token: "$.token"
     token_name: "auth_token"
     data_source: "users"
+    threads_per_second: 1  # Solo necesitamos un hilo para autenticación
 
   - name: "get_profile"
     url: "https://api.example.com/profile"
@@ -203,12 +205,33 @@ services:
       Content-Type: "application/json"
       Authorization: "Bearer {{.auth_token}}"
     depends_on: "auth"
+    threads_per_second: 5  # Usar 5 hilos por segundo para este servicio
+
+  - name: "update_profile"
+    url: "https://api.example.com/profile"
+    method: "PUT"
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Bearer {{.auth_token}}"
+    body_template: |
+      {
+        "name": "{{.name}}",
+        "email": "{{.email}}",
+        "phone": "{{.phone}}"
+      }
+    depends_on: "auth"
+    data_source: "profiles"
+    # Si no se especifica threads_per_second, se usa el valor global (10)
 
 # Fuentes de datos
 data_sources:
   csv:
     users:
       path: "data/users.csv"
+      delimiter: ","
+      has_header: true
+    profiles:
+      path: "data/profiles.csv"
       delimiter: ","
       has_header: true
 `
