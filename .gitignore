@@ -31,3 +31,4 @@ gmeter.yaml
 # Archivos de sistema
 .DS_Store
 Thumbs.db 
+*.gz

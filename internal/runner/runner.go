@@ -6,45 +6,127 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"text/template"
 	"time"
 
+	"bufio"
+
 	"github.com/KaribuLab/gmeter/internal/config"
 	"github.com/KaribuLab/gmeter/internal/logger"
 	"github.com/KaribuLab/gmeter/internal/models"
 	"github.com/KaribuLab/gmeter/internal/reporter"
 	"github.com/google/uuid"
+	"github.com/natefinch/lumberjack"
 	"github.com/tidwall/gjson"
 )
 
 // Runner es el ejecutor principal de las pruebas
 type Runner struct {
-	Config     *config.Config
-	Logger     *logger.Logger
-	Client     *http.Client
-	Results    chan *models.Response
-	DataSource map[string]interface{}
-	WaitGroup  sync.WaitGroup
-	StartTime  time.Time
-	EndTime    time.Time
+	Config         *config.Config
+	Logger         *logger.Logger
+	ResponseWriter io.Writer
+	bufferedWriter *bufio.Writer
+	responseLogCh  chan string   // Canal para escritura asíncrona de logs
+	stopLogCh      chan struct{} // Canal para detener la goroutine de escritura
+	Client         *http.Client
+	Results        chan *models.Response
+	DataSource     map[string]interface{}
+	WaitGroup      sync.WaitGroup
+	StartTime      time.Time
+	EndTime        time.Time
+	StopChan       chan struct{} // Canal para señalizar la terminación
 }
 
 // NewRunner crea un nuevo ejecutor de pruebas
-func NewRunner(cfg *config.Config, logger *logger.Logger) *Runner {
-	return &Runner{
-		Config: cfg,
-		Logger: logger,
-		Client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-		Results:    make(chan *models.Response, 1000),
-		DataSource: make(map[string]interface{}),
+func NewRunner(cfg *config.Config, log *logger.Logger) *Runner {
+	// Un escritor para las respuestas HTTP
+	var responseWriter io.Writer = ioutil.Discard // Por defecto, descartar las respuestas
+	var bufferedWriter *bufio.Writer
+
+	// Canal para escritura asíncrona de logs, con buffer para evitar bloqueos
+	responseLogCh := make(chan string, 1000)
+	stopLogCh := make(chan struct{})
+
+	// Inicializar el escritor de respuestas si se ha configurado un archivo
+	if cfg.ResponseLogFile != "" {
+		log.Infof("Configurando archivo de respuestas en: %s", cfg.ResponseLogFile)
+
+		// Asegurarse de que el directorio del archivo de log exista
+		dir := filepath.Dir(cfg.ResponseLogFile)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			log.Errorf("Error al crear el directorio para el archivo de respuestas: %v", err)
+		}
+
+		// Configurar el escritor con rotación
+		fileWriter := &lumberjack.Logger{
+			Filename:   cfg.ResponseLogFile,
+			MaxSize:    10,   // 10 MB
+			MaxBackups: 5,    // 5 archivos de respaldo
+			MaxAge:     30,   // 30 días
+			Compress:   true, // Comprimir los archivos rotados
+		}
+
+		// Crear un escritor con buffer para mejorar el rendimiento
+		bufferedWriter = bufio.NewWriterSize(fileWriter, 4096) // Buffer de 4KB
+		responseWriter = bufferedWriter
+
+		log.Infof("Archivo de respuestas configurado exitosamente: %s", cfg.ResponseLogFile)
+	} else {
+		log.Warn("No se configuró archivo para respuestas HTTP (response_log_file)")
+	}
+
+	r := &Runner{
+		Config:         cfg,
+		Logger:         log,
+		ResponseWriter: responseWriter,
+		bufferedWriter: bufferedWriter,
+		responseLogCh:  responseLogCh,
+		stopLogCh:      stopLogCh,
+		Client:         &http.Client{},
+		Results:        make(chan *models.Response, 100),
+		DataSource:     make(map[string]interface{}),
+		StopChan:       make(chan struct{}),
+	}
+
+	// Iniciar goroutine para escritura asíncrona si hay un archivo configurado
+	if cfg.ResponseLogFile != "" {
+		go r.processResponseLogs()
+	}
+
+	return r
+}
+
+// processResponseLogs procesa asíncronamente los logs de respuestas
+func (r *Runner) processResponseLogs() {
+	r.Logger.Info("Iniciando procesador asíncrono de logs de respuestas")
+
+	for {
+		select {
+		case logMsg, ok := <-r.responseLogCh:
+			if !ok {
+				// Canal cerrado, terminar
+				r.Logger.Debug("Canal de logs de respuestas cerrado, finalizando procesador")
+				return
+			}
+
+			// Escribir el mensaje al buffer
+			if _, err := fmt.Fprintf(r.ResponseWriter, "%s\n", logMsg); err != nil {
+				r.Logger.Warnf("Error al escribir log de respuesta: %v", err)
+			}
+
+		case <-r.stopLogCh:
+			// Señal de terminación recibida
+			r.Logger.Debug("Señal de terminación recibida, finalizando procesador de logs")
+			return
+		}
 	}
 }
 
@@ -60,6 +142,33 @@ func (r *Runner) Run() error {
 	// Iniciar el recolector de resultados
 	resultCollector := make(chan *models.TestResult)
 	go r.collectResults(resultCollector)
+
+	// Si tenemos un bufferedWriter, iniciamos una goroutine para vaciarlo periódicamente
+	if r.bufferedWriter != nil {
+		stopFlushTimer := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ticker.C:
+					// Vaciar el buffer periódicamente
+					r.Logger.Debug("Vaciando buffer del archivo de respuestas (periódico)")
+					if err := r.bufferedWriter.Flush(); err != nil {
+						r.Logger.Warnf("Error al vaciar el buffer de respuestas (periódico): %v", err)
+					}
+				case <-stopFlushTimer:
+					return
+				}
+			}
+		}()
+
+		// Asegurar que el canal se cierre al terminar
+		defer func() {
+			close(stopFlushTimer)
+		}()
+	}
 
 	// Ejecutar las pruebas
 	r.StartTime = time.Now()
@@ -158,20 +267,18 @@ func (r *Runner) Run() error {
 		}
 	}
 
-	// Esperar a que terminen todos los hilos
-	done := make(chan struct{})
-	go func() {
-		r.WaitGroup.Wait()
-		close(done)
-	}()
+	// Modificado: Esperar únicamente a que termine la duración
+	// Esto asegura que la prueba dure exactamente el tiempo especificado
+	r.Logger.Infof("Esperando %s para que termine la prueba", duration)
+	time.Sleep(duration)
 
-	// Esperar a que termine la duración o todos los hilos
-	select {
-	case <-time.After(duration):
-		r.Logger.Info("Tiempo de prueba completado")
-	case <-done:
-		r.Logger.Info("Todos los hilos han terminado")
-	}
+	// Señalizar a todos los hilos que deben terminar
+	close(r.StopChan)
+	r.Logger.Info("Tiempo de prueba completado, esperando a que terminen los hilos")
+
+	// Esperar a que todos los hilos terminen
+	r.WaitGroup.Wait()
+	r.Logger.Info("Todos los hilos han terminado")
 
 	// Cerrar el canal de resultados
 	close(r.Results)
@@ -179,6 +286,22 @@ func (r *Runner) Run() error {
 	// Esperar a que termine el recolector de resultados
 	result := <-resultCollector
 	r.EndTime = time.Now()
+
+	// Cerrar el canal de logs de respuestas y esperar a que se complete el procesamiento
+	if r.responseLogCh != nil {
+		r.Logger.Info("Cerrando sistema de logs de respuestas")
+		close(r.responseLogCh)
+		// Enviar señal para terminar la goroutine
+		close(r.stopLogCh)
+	}
+
+	// Vaciar el buffer del escritor de respuestas si existe
+	if r.bufferedWriter != nil {
+		r.Logger.Info("Vaciando buffer del archivo de respuestas (final)")
+		if err := r.bufferedWriter.Flush(); err != nil {
+			r.Logger.Warnf("Error al vaciar el buffer de respuestas (final): %v", err)
+		}
+	}
 
 	// Generar el reporte
 	r.Logger.Info("Generando reporte")
@@ -498,55 +621,55 @@ func (r *Runner) runServiceThread(id int, service *config.Service) {
 						return
 					}
 					tempThreadContext.Data = data
-					r.Logger.Debugf("Hilo %d usando registro %d de %d para el servicio dependiente %s",
-						id, recordIndex+1, lazyDS.Len(), dependentService.Name)
 				} else {
 					// Compatibilidad con el código existente (registros ya cargados)
 					records, ok := dataSource.([]models.DataRecord)
 					if !ok {
-						r.Logger.Warnf("Tipo de fuente de datos no compatible para el servicio %s", dependentService.Name)
+						r.Logger.Warnf("Tipo de fuente de datos no compatible para el servicio dependiente %s", dependentService.Name)
 						return
 					}
 
 					if len(records) > 0 {
+						// Seleccionar un registro basado en el ID del hilo, ciclando si es necesario
 						recordIndex := (id - 1) % len(records)
-						data := records[recordIndex]
-						tempThreadContext.Data = data
-						r.Logger.Debugf("Hilo %d usando registro %d de %d para el servicio dependiente %s",
-							id, recordIndex+1, len(records), dependentService.Name)
-					} else {
-						r.Logger.Warnf("No hay datos disponibles para el servicio %s", dependentService.Name)
-						return
+						tempThreadContext.Data = records[recordIndex]
 					}
 				}
-			} else {
-				r.Logger.Warnf("No hay datos disponibles para el servicio %s", dependentService.Name)
-				return
 			}
 		}
 
-		// Ejecutar el servicio dependiente
-		resp, err := r.executeService(dependentService, tempThreadContext)
+		// Ejecutar el servicio dependiente para obtener el token
+		depResp, err := r.executeService(dependentService, tempThreadContext)
 		if err != nil {
 			r.Logger.WithError(err).Errorf("Error al ejecutar el servicio dependiente %s", dependentService.Name)
 			return
 		}
 
-		// Enviar el resultado
-		r.Results <- resp
-
-		// Extraer el token
+		// Si el servicio extrae un token, guardarlo
 		if dependentService.ExtractToken != "" && dependentService.TokenName != "" {
 			// Parsear la respuesta como JSON
-			if resp.Body != nil {
+			if depResp.Body != nil {
 				// Extraer el token usando gjson
-				token := gjson.GetBytes(resp.Body, dependentService.ExtractToken).String()
+				token := gjson.GetBytes(depResp.Body, dependentService.ExtractToken).String()
 				if token != "" {
-					tempThreadContext.TokenStore.SetToken(dependentService.TokenName, token)
-					r.Logger.Infof("Token extraído para %s: %s", dependentService.TokenName, token)
+					// Si se ha configurado la caché con tiempo de expiración
+					if dependentService.CacheToken && dependentService.TokenExpiry != "" {
+						expiryDuration, err := time.ParseDuration(dependentService.TokenExpiry)
+						if err != nil {
+							r.Logger.Warnf("Error al parsear la duración de expiración del token para %s: %v", dependentService.TokenName, err)
+							// Si hay error, usar SetToken normal
+							tempThreadContext.TokenStore.SetToken(dependentService.TokenName, token)
+						} else {
+							tempThreadContext.TokenStore.SetTokenWithExpiry(dependentService.TokenName, token, expiryDuration)
+							r.Logger.Debugf("Token extraído para %s con expiración de %s", dependentService.TokenName, dependentService.TokenExpiry)
+						}
+					} else {
+						// Comportamiento estándar sin caché con tiempo
+						tempThreadContext.TokenStore.SetToken(dependentService.TokenName, token)
+						r.Logger.Debugf("Token extraído para el servicio dependiente %s: %s", dependentService.TokenName, token)
+					}
 				} else {
 					r.Logger.Warnf("No se pudo extraer el token para %s", dependentService.TokenName)
-					return
 				}
 			}
 		}
@@ -598,78 +721,158 @@ func (r *Runner) runServiceThread(id int, service *config.Service) {
 				}
 
 				if len(records) > 0 {
-					// Verificar si hay menos registros que hilos y mostrar advertencia
-					threadsPerSecond := service.ThreadsPerSecond
-					if threadsPerSecond == 0 {
-						threadsPerSecond = r.Config.GlobalConfig.ThreadsPerSecond
-					}
-					if len(records) < threadsPerSecond {
-						r.Logger.Warnf("El servicio %s tiene menos registros (%d) que hilos (%d). Los datos se reciclarán.",
-							service.Name, len(records), threadsPerSecond)
-					}
-
 					// Seleccionar un registro basado en el ID del hilo, ciclando si es necesario
 					recordIndex := (id - 1) % len(records)
 					data = records[recordIndex]
-
-					// Mostrar información detallada sobre el registro utilizado
-					r.Logger.Infof("Hilo %d usando registro %d de %d para el servicio %s",
-						id, recordIndex+1, len(records), service.Name)
-
-					// Mostrar los datos del registro
-					for k, v := range data {
-						r.Logger.Infof("  - %s: %s", k, v)
-					}
-				} else {
-					r.Logger.Warnf("No hay datos disponibles para el servicio %s", service.Name)
-					return
 				}
 			}
-		} else {
-			r.Logger.Warnf("No hay datos disponibles para el servicio %s", service.Name)
-			return
 		}
 	}
 
-	// Crear el contexto del hilo si no existe
+	// Si no hay un contexto de hilo, crearlo
 	if threadContext == nil {
 		threadContext = models.NewThreadContext(id, data)
-	} else {
-		// Actualizar los datos del contexto
-		if threadContext.Data == nil {
-			threadContext.Data = make(models.DataRecord)
-		}
-		for k, v := range data {
-			threadContext.Data[k] = v
-		}
+	} else if data != nil {
+		// Si ya hay un contexto pero no tiene datos, agregarlos
+		threadContext.Data = data
 	}
 
-	// Ejecutar el servicio
-	resp, err := r.executeService(service, threadContext)
-	if err != nil {
-		r.Logger.WithError(err).Errorf("Error al ejecutar el servicio %s", service.Name)
-		return
-	}
+	// Contador para llevar un registro del número de ejecuciones
+	executionCount := 0
 
-	// Enviar el resultado
-	r.Results <- resp
+	// Bucle principal: ejecutar hasta recibir señal de terminación
+	for {
+		select {
+		case <-r.StopChan:
+			// Señal de terminación recibida
+			r.Logger.Debugf("Hilo %d del servicio %s terminando después de %d ejecuciones",
+				id, service.Name, executionCount)
+			return
+		default:
+			// Continuar con la ejecución
+			executionCount++
 
-	// Si el servicio extrae un token, guardarlo
-	if service.ExtractToken != "" && service.TokenName != "" {
-		// Parsear la respuesta como JSON
-		if resp.Body != nil {
-			// Extraer el token usando gjson
-			token := gjson.GetBytes(resp.Body, service.ExtractToken).String()
-			if token != "" {
-				threadContext.TokenStore.SetToken(service.TokenName, token)
-				r.Logger.Infof("Token extraído para %s: %s", service.TokenName, token)
-			} else {
-				r.Logger.Warnf("No se pudo extraer el token para %s", service.TokenName)
+			// Si este es un servicio que depende de otro y ejecutamos más de una vez,
+			// puede ser necesario actualizar el token
+			if service.DependsOn != "" && executionCount > 1 {
+				// Buscar el servicio del que depende
+				var dependentService *config.Service
+				for _, s := range r.Config.Services {
+					if s.Name == service.DependsOn {
+						dependentService = s
+						break
+					}
+				}
+
+				if dependentService != nil {
+					// Verificar si necesitamos actualizar el token
+					tokenNeedsUpdate := true
+
+					// Si el token tiene caché con tiempo de expiración, verificar si ha expirado
+					if dependentService.CacheToken && dependentService.TokenName != "" {
+						// Comprobar si el token existe y si ha expirado
+						if !threadContext.TokenStore.IsTokenExpired(dependentService.TokenName) {
+							// El token no ha expirado, no necesita actualización
+							tokenNeedsUpdate = false
+						} else {
+							r.Logger.Debugf("Token para %s ha expirado, actualizando", dependentService.TokenName)
+						}
+					}
+
+					if tokenNeedsUpdate {
+						// Ejecutar el servicio dependiente para actualizar el token
+						depResp, err := r.executeService(dependentService, threadContext)
+						if err != nil {
+							r.Logger.WithError(err).Errorf("Error al actualizar el token del servicio dependiente %s", dependentService.Name)
+							// Esperar un momento antes de reintentar
+							time.Sleep(500 * time.Millisecond)
+							continue
+						}
+
+						// Si el servicio extrae un token, actualizarlo
+						if dependentService.ExtractToken != "" && dependentService.TokenName != "" && depResp.Body != nil {
+							token := gjson.GetBytes(depResp.Body, dependentService.ExtractToken).String()
+							if token != "" {
+								// Si se ha configurado la caché con tiempo de expiración
+								if dependentService.CacheToken && dependentService.TokenExpiry != "" {
+									expiryDuration, err := time.ParseDuration(dependentService.TokenExpiry)
+									if err != nil {
+										r.Logger.Warnf("Error al parsear la duración de expiración del token para %s: %v", dependentService.TokenName, err)
+										// Si hay error, usar SetToken normal
+										threadContext.TokenStore.SetToken(dependentService.TokenName, token)
+									} else {
+										threadContext.TokenStore.SetTokenWithExpiry(dependentService.TokenName, token, expiryDuration)
+										r.Logger.Debugf("Token actualizado para %s con expiración de %s", dependentService.TokenName, dependentService.TokenExpiry)
+									}
+								} else {
+									// Comportamiento estándar sin caché con tiempo
+									threadContext.TokenStore.SetToken(dependentService.TokenName, token)
+									r.Logger.Debugf("Token actualizado para el servicio dependiente %s: %s", dependentService.TokenName, token)
+								}
+							}
+						}
+					}
+				}
 			}
+
+			// Ejecutar el servicio
+			resp, err := r.executeService(service, threadContext)
+			if err != nil {
+				r.Logger.WithError(err).Errorf("Error al ejecutar el servicio %s (ejecución %d)",
+					service.Name, executionCount)
+				// Esperar un momento antes de reintentar
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+
+			// Enviar el resultado
+			r.Results <- resp
+
+			// Si el servicio extrae un token, guardarlo
+			if service.ExtractToken != "" && service.TokenName != "" && resp.Body != nil {
+				token := gjson.GetBytes(resp.Body, service.ExtractToken).String()
+				if token != "" {
+					// Si se ha configurado la caché con tiempo de expiración
+					if service.CacheToken && service.TokenExpiry != "" {
+						expiryDuration, err := time.ParseDuration(service.TokenExpiry)
+						if err != nil {
+							r.Logger.Warnf("Error al parsear la duración de expiración del token para %s: %v", service.TokenName, err)
+							// Si hay error, usar SetToken normal
+							threadContext.TokenStore.SetToken(service.TokenName, token)
+						} else {
+							threadContext.TokenStore.SetTokenWithExpiry(service.TokenName, token, expiryDuration)
+							if executionCount == 1 || executionCount%100 == 0 {
+								r.Logger.Infof("Token extraído para %s con expiración de %s", service.TokenName, service.TokenExpiry)
+							} else {
+								r.Logger.Debugf("Token extraído para %s con expiración de %s", service.TokenName, service.TokenExpiry)
+							}
+						}
+					} else {
+						// Comportamiento estándar sin caché con tiempo
+						threadContext.TokenStore.SetToken(service.TokenName, token)
+						if executionCount == 1 || executionCount%100 == 0 {
+							// Solo mostrar el token en la primera ejecución o cada 100 ejecuciones para no saturar los logs
+							r.Logger.Infof("Token extraído para %s: %s", service.TokenName, token)
+						} else {
+							r.Logger.Debugf("Token extraído para %s: %s", service.TokenName, token)
+						}
+					}
+				} else {
+					r.Logger.Warnf("No se pudo extraer el token para %s", service.TokenName)
+				}
+			}
+
+			if executionCount == 1 {
+				r.Logger.Infof("Hilo %d del servicio %s completó su primera ejecución", id, service.Name)
+			} else if executionCount%100 == 0 {
+				// Mostrar progreso cada 100 ejecuciones
+				r.Logger.Infof("Hilo %d del servicio %s ha ejecutado %d veces", id, service.Name, executionCount)
+			}
+
+			// Pequeña pausa para no saturar el sistema, especialmente si hay muchos hilos
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
-
-	r.Logger.Infof("Hilo %d completado para el servicio %s", id, service.Name)
 }
 
 // executeService ejecuta un servicio
@@ -918,10 +1121,64 @@ func (r *Runner) executeService(service *config.Service, ctx *models.ThreadConte
 	response.StatusCode = resp.StatusCode
 	response.Headers = resp.Header
 
-	// Loguear la respuesta HTTP
+	// Loguear la respuesta HTTP en el logger principal
 	r.Logger.Infof("Respuesta %s %s: %d %s (%s)", req.Method, req.URL.String(),
 		resp.StatusCode, http.StatusText(resp.StatusCode), responseTime)
 	r.Logger.Debugf("Headers respuesta: %v", resp.Header)
+
+	// Registrar la respuesta completa en el logger de respuestas
+	if r.ResponseWriter != nil {
+		// Crear una representación de texto legible de la respuesta
+		var bodyContent string
+		if len(response.Body) > 0 {
+			// Intentar formatear el JSON para mejor legibilidad
+			var prettyJSON bytes.Buffer
+			if err := json.Indent(&prettyJSON, response.Body, "", "  "); err == nil {
+				bodyContent = prettyJSON.String()
+			} else {
+				// Si no es JSON válido, usar el string original
+				bodyContent = string(response.Body)
+			}
+		}
+
+		// Crear un log de texto legible con detalles completos
+		responseLog := fmt.Sprintf(
+			"===== RESPUESTA HTTP =====\n"+
+				"Timestamp: %s\n"+
+				"Servicio: %s\n"+
+				"Método: %s\n"+
+				"URL: %s\n"+
+				"Código de estado: %d (%s)\n"+
+				"Tiempo de respuesta: %s\n"+
+				"Hilo ID: %d\n"+
+				"ID de correlación: %s\n"+
+				"Cabeceras:\n%s\n"+
+				"Cuerpo:\n%s\n"+
+				"========================\n",
+			time.Now().Format(time.RFC3339),
+			service.Name,
+			req.Method,
+			req.URL.String(),
+			resp.StatusCode,
+			http.StatusText(resp.StatusCode),
+			responseTime.String(),
+			ctx.ID,
+			ctx.CorrelationID,
+			formatHeaders(resp.Header),
+			bodyContent,
+		)
+
+		// Enviar el log al canal asíncrono en lugar de escribir directamente
+		select {
+		case r.responseLogCh <- responseLog:
+			// Enviado exitosamente
+		default:
+			// Canal lleno, registrar advertencia pero no bloquear
+			r.Logger.Warn("Canal de logs de respuestas lleno, omitiendo una respuesta")
+		}
+	}
+
+	// Debug del body en el logger principal (versión resumida)
 	if len(response.Body) > 0 {
 		if len(response.Body) > 1000 {
 			r.Logger.Debugf("Body respuesta: %s... (truncado)", string(response.Body[:1000]))
@@ -1390,4 +1647,15 @@ func generateStatusCodeChart(stats *models.ServiceStats) string {
 func containsTemplate(s string) bool {
 	// Verificar si la cadena contiene "{{" y "}}" para ser considerada una plantilla
 	return strings.Contains(s, "{{") && strings.Contains(s, "}}")
+}
+
+// formatHeaders formatea las cabeceras de la respuesta HTTP para una mejor legibilidad
+func formatHeaders(headers http.Header) string {
+	var formattedHeaders string
+	for name, values := range headers {
+		for _, value := range values {
+			formattedHeaders += fmt.Sprintf("%s: %s\n", name, value)
+		}
+	}
+	return formattedHeaders
 }

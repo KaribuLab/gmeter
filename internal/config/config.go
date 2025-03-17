@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
@@ -13,11 +14,12 @@ import (
 
 // Config representa la configuración principal de la aplicación
 type Config struct {
-	LogFile      string     `mapstructure:"log_file"`
-	ReportDir    string     `mapstructure:"report_dir"`
-	GlobalConfig RunConfig  `mapstructure:"global"`
-	Services     []*Service `mapstructure:"services"`
-	DataSources  DataSource `mapstructure:"data_sources"`
+	LogFile         string     `mapstructure:"log_file"`
+	ResponseLogFile string     `mapstructure:"response_log_file"` // Archivo de log para las respuestas HTTP
+	ReportDir       string     `mapstructure:"report_dir"`
+	GlobalConfig    RunConfig  `mapstructure:"global"`
+	Services        []*Service `mapstructure:"services"`
+	DataSources     DataSource `mapstructure:"data_sources"`
 
 	// Configuración original para reportes (sin reemplazar variables)
 	OriginalConfig string
@@ -45,6 +47,8 @@ type Service struct {
 	DependsOn        string            `mapstructure:"depends_on"`
 	ExtractToken     string            `mapstructure:"extract_token"`
 	TokenName        string            `mapstructure:"token_name"`
+	CacheToken       bool              `mapstructure:"cache_token"`  // Indica si se debe cachear el token
+	TokenExpiry      string            `mapstructure:"token_expiry"` // Duración de validez del token (ej: "30m", "1h")
 	DataSourceName   string            `mapstructure:"data_source"`
 	ThreadsPerSecond int               `mapstructure:"threads_per_second"` // Para compatibilidad con versiones anteriores
 	MinThreads       int               `mapstructure:"min_threads"`        // Número mínimo de hilos al iniciar
@@ -72,6 +76,7 @@ func LoadConfig(cfgFile string) (*Config, error) {
 
 	// Configuración por defecto
 	v.SetDefault("log_file", "gmeter.log")
+	v.SetDefault("response_log_file", "gmeter_responses.log") // Valor por defecto para el log de respuestas
 	v.SetDefault("report_dir", "reports")
 	v.SetDefault("global.threads_per_second", 10)
 	v.SetDefault("global.duration", "1m")
@@ -234,6 +239,17 @@ func validateConfig(cfg *Config) error {
 		}
 		if svc.Method == "" {
 			svc.Method = "GET" // Método por defecto
+		}
+
+		// Validar la configuración de caché de tokens
+		if svc.TokenExpiry != "" {
+			// Verificar que TokenExpiry sea una duración válida
+			_, err := time.ParseDuration(svc.TokenExpiry)
+			if err != nil {
+				return fmt.Errorf("el servicio %s tiene un valor inválido para token_expiry: %s", svc.Name, err)
+			}
+			// Si se define TokenExpiry, asumir que se desea cachear el token
+			svc.CacheToken = true
 		}
 
 		// Validar límites de hilos por segundo por servicio

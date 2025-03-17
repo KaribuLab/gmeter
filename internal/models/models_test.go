@@ -31,6 +31,40 @@ func TestTokenStore(t *testing.T) {
 	value, ok = ts.GetToken("nonexistent_token")
 	assert.False(t, ok, "El token no debería existir")
 	assert.Equal(t, "", value, "El valor del token debería ser una cadena vacía")
+
+	// Probar la funcionalidad de expiración
+	// Establecer un token con un tiempo de expiración breve
+	ts.SetTokenWithExpiry("expiring_token", "expiring_value", 10*time.Millisecond)
+
+	// Verificar que el token se ha establecido correctamente
+	value, ok = ts.GetToken("expiring_token")
+	assert.True(t, ok, "El token debería existir inmediatamente después de establecerlo")
+	assert.Equal(t, "expiring_value", value, "El valor del token no coincide")
+
+	// Comprobar que el token no está expirado inicialmente
+	assert.False(t, ts.IsTokenExpired("expiring_token"), "El token no debería estar expirado inicialmente")
+
+	// Esperar a que el token expire
+	time.Sleep(15 * time.Millisecond)
+
+	// Verificar que el token ha expirado
+	assert.True(t, ts.IsTokenExpired("expiring_token"), "El token debería estar expirado después de esperar")
+
+	// Intentar obtener el token expirado
+	value, ok = ts.GetToken("expiring_token")
+	assert.False(t, ok, "El token expirado no debería existir")
+	assert.Equal(t, "", value, "El valor del token expirado debería ser una cadena vacía")
+
+	// Probar la eliminación manual de un token
+	ts.SetToken("token_to_remove", "value_to_remove")
+	ts.RemoveToken("token_to_remove")
+	value, ok = ts.GetToken("token_to_remove")
+	assert.False(t, ok, "El token eliminado no debería existir")
+
+	// Probar establecer el tiempo de expiración por defecto
+	assert.Equal(t, 30*time.Minute, ts.DefaultExpiry, "El tiempo de expiración por defecto inicial debe ser 30 minutos")
+	ts.SetDefaultExpiry(1 * time.Hour)
+	assert.Equal(t, 1*time.Hour, ts.DefaultExpiry, "El tiempo de expiración por defecto debería actualizarse a 1 hora")
 }
 
 func TestThreadContext(t *testing.T) {

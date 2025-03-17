@@ -1,5 +1,6 @@
 # Configuración de GMeter
 log_file: "gmeter.log"
+response_log_file: "gmeter_responses.log" # Archivo separado para guardar las respuestas HTTP completas
 report_dir: "reports"
 
 # Configuración global
@@ -26,6 +27,8 @@ services:
       }
     extract_token: "token"  # Nombre del campo que contiene el token en la respuesta JSON
     token_name: "auth_token"  # Nombre con el que se guardará el token
+    cache_token: true  # Activar caché para el token (evita peticiones innecesarias)
+    token_expiry: "1h"  # El token expira después de 1 hora
     min_threads: 1            # Mínimo 1 hilo para autenticación
     max_threads: 1            # Máximo 1 hilo para autenticación
 
@@ -42,6 +45,8 @@ services:
       scope: "read write"
     extract_token: "access_token"
     token_name: "oauth_token"
+    cache_token: true  # Activar caché para el token
+    token_expiry: "30m"  # El token expira después de 30 minutos
     min_threads: 1
     max_threads: 1
 

@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -150,6 +151,79 @@ func TestExecuteService(t *testing.T) {
 	assert.NotNil(t, resp.Body, "El cuerpo de la respuesta no debería ser nil")
 	assert.Contains(t, string(resp.Body), "Hello, World!", "El cuerpo de la respuesta no contiene el mensaje esperado")
 	assert.Contains(t, string(resp.Body), "test_token", "El cuerpo de la respuesta no contiene el token esperado")
+}
+
+func TestExecuteServiceWithTokenCache(t *testing.T) {
+	// Contador para saber cuántas veces se llama al endpoint
+	endpointCalls := 0
+
+	// Crear un servidor HTTP de prueba
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Incrementar el contador
+		endpointCalls++
+
+		// Verificar el método
+		assert.Equal(t, "GET", r.Method, "El método no coincide")
+
+		// Responder con un JSON
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"message": "Hello, World!", "token": "test_token_` + fmt.Sprintf("%d", endpointCalls) + `"}`))
+	}))
+	defer server.Close()
+
+	// Crear la configuración
+	service := &config.Service{
+		Name:   "test",
+		URL:    server.URL,
+		Method: "GET",
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+		},
+		ExtractToken: "token",
+		TokenName:    "test_token",
+		CacheToken:   true,
+		TokenExpiry:  "10m", // 10 minutos de expiración
+	}
+
+	// Crear la configuración
+	cfg := &config.Config{
+		Services: []*config.Service{service},
+	}
+
+	// Crear el logger
+	log := logger.New()
+	log.SetOutput(os.Stdout)
+
+	// Crear el runner
+	runner := NewRunner(cfg, log)
+
+	// Crear el contexto del hilo
+	threadContext := models.NewThreadContext(1, nil)
+
+	// Ejecutar el servicio - Primera llamada
+	resp1, err := runner.executeService(service, threadContext)
+	require.NoError(t, err, "Error al ejecutar el servicio (primera vez)")
+
+	// Verificar la respuesta
+	assert.NotNil(t, resp1, "La respuesta no debería ser nil")
+	assert.Equal(t, http.StatusOK, resp1.StatusCode, "El código de estado no coincide")
+
+	// Verificar que el token se ha guardado con expiración
+	token, ok := threadContext.TokenStore.GetToken("test_token")
+	assert.True(t, ok, "El token debería existir")
+	assert.Equal(t, "test_token_1", token, "El valor del token no coincide")
+
+	// Verificar que se registró el tiempo de expiración
+	assert.False(t, threadContext.TokenStore.IsTokenExpired("test_token"), "El token no debería estar expirado")
+
+	// Ejecutar el servicio de nuevo - Segunda llamada
+	_, err = runner.executeService(service, threadContext)
+	require.NoError(t, err, "Error al ejecutar el servicio (segunda vez)")
+
+	// Verificar que se obtuvieron las respuestas correctas
+	assert.Equal(t, "test_token_1", token, "El valor del token debe seguir siendo el mismo para la segunda llamada")
+	assert.Equal(t, 2, endpointCalls, "El endpoint debería haberse llamado 2 veces, una para cada ejecución del servicio")
 }
 
 func TestContainsTemplate(t *testing.T) {
