@@ -45,12 +45,12 @@ services:
     method: "POST"
     headers:
       Content-Type: "application/json"
-    body_template: |
+    body: |
       {
         "username": "{{.username}}",
         "password": "{{.password}}"
       }
-    extract_token: "$.token"
+    extract_token: "token"
     token_name: "auth_token"
     data_source: "users"
 
@@ -106,8 +106,8 @@ data_sources:
 	cfg.Services[1].Headers["Authorization"] = "Bearer {{.auth_token}}"
 
 	assert.Equal(t, "application/json", cfg.Services[0].Headers["Content-Type"], "El header Content-Type del primer servicio no coincide")
-	assert.Contains(t, cfg.Services[0].BodyTemplate, "{{.username}}", "La plantilla del cuerpo del primer servicio no contiene el placeholder de username")
-	assert.Equal(t, "$.token", cfg.Services[0].ExtractToken, "La expresión para extraer el token no coincide")
+	assert.Contains(t, cfg.Services[0].Body, "{{.username}}", "La plantilla del cuerpo del primer servicio no contiene el placeholder de username")
+	assert.Equal(t, "token", cfg.Services[0].ExtractToken, "La expresión para extraer el token no coincide")
 	assert.Equal(t, "auth_token", cfg.Services[0].TokenName, "El nombre del token no coincide")
 	assert.Equal(t, "users", cfg.Services[0].DataSourceName, "El nombre de la fuente de datos no coincide")
 

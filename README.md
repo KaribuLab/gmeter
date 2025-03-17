@@ -17,6 +17,7 @@ GMeter es una herramienta de línea de comandos para realizar pruebas de stress 
 - Extracción de tokens de respuestas
 - Generación de reportes detallados con gráficos SVG integrados
 - Sistema de logs con colores y rotación de archivos
+- Soporte para variables de entorno y secretos mediante archivo .env
 
 ## Instalación
 
@@ -77,7 +78,9 @@ report_dir: "reports"
 
 # Configuración global
 global:
-  threads_per_second: 10
+  threads_per_second: 10  # Para compatibilidad con versiones anteriores
+  min_threads: 5          # Número mínimo de hilos al inicio
+  max_threads: 20         # Número máximo de hilos a alcanzar
   duration: "1m"
   ramp_up: "10s"
 
@@ -88,15 +91,36 @@ services:
     method: "POST"
     headers:
       Content-Type: "application/json"
-    body_template: |
+      X-Request-ID: "{{uuid}}"  # Generar un UUID único para cada solicitud
+    body: |
       {
         "username": "{{.username}}",
-        "password": "{{.password}}"
+        "password": "{{.password}}",
+        "request_id": "{{uuid}}"  # Generar un UUID único para cada solicitud
       }
-    extract_token: "$.token"
-    token_name: "auth_token"
     data_source: "users"
+    extract_token: "token"
+    token_name: "auth_token"
     threads_per_second: 1  # Solo necesitamos un hilo para autenticación
+
+  # Ejemplo de servicio con form-urlencoded
+  - name: "auth_form"
+    url: "https://api.example.com/oauth/token"
+    method: "POST"
+    headers:
+      Content-Type: "application/x-www-form-urlencoded"
+    content_type: "form"  # Especificar que es un formulario
+    form_data:  # Datos estáticos del formulario
+      grant_type: "password"
+      client_id: "my_client"
+    form_data_template:  # Plantilla para datos dinámicos
+      username: "{{.username}}"
+      password: "{{.password}}"
+      request_id: "{{uuid}}"  # Generar un UUID único para cada solicitud
+    data_source: "users"
+    extract_token: "token"
+    token_name: "form_token"
+    threads_per_second: 1
 
   - name: "get_profile"
     url: "https://api.example.com/profile"
@@ -113,7 +137,7 @@ services:
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {{.auth_token}}"
-    body_template: |
+    body: |
       {
         "name": "{{.name}}",
         "email": "{{.email}}",
@@ -145,9 +169,11 @@ data_sources:
 
 #### Configuración de Ejecución
 
-- `threads_per_second`: Número de hilos por segundo (valor por defecto para todos los servicios)
+- `threads_per_second`: Número de hilos por segundo (para compatibilidad con versiones anteriores, mínimo 1, máximo 1000)
+- `min_threads`: Número mínimo de hilos al iniciar la prueba (mínimo 1, máximo 1000)
+- `max_threads`: Número máximo de hilos a alcanzar durante la prueba (mínimo 1, máximo 1000)
 - `duration`: Duración total de la prueba (formato: "1h", "30m", "1m30s", etc.)
-- `ramp_up`: Tiempo de rampa para alcanzar el número total de hilos (formato: "10s", "1m", etc.)
+- `ramp_up`: Tiempo de rampa para incrementar gradualmente desde el mínimo hasta el máximo de hilos (formato: "10s", "1m", etc.)
 
 #### Servicios
 
@@ -155,13 +181,17 @@ data_sources:
 - `url`: URL del servicio
 - `method`: Método HTTP (GET, POST, PUT, DELETE, etc.)
 - `headers`: Cabeceras HTTP
-- `body`: Cuerpo de la solicitud (texto plano)
-- `body_template`: Plantilla para el cuerpo de la solicitud (usando la sintaxis de plantillas de Go)
+- `content_type`: Tipo de contenido de la petición ("json" o "form")
+- `body`: Cuerpo de la solicitud (puede contener plantillas usando la sintaxis de Go)
+- `form_data`: Datos de formulario estáticos para peticiones form-urlencoded
+- `form_data_template`: Plantilla para datos de formulario (usando la sintaxis de plantillas de Go)
 - `depends_on`: Nombre del servicio del que depende
-- `extract_token`: Expresión JSONPath para extraer un token de la respuesta
+- `extract_token`: Nombre del campo para extraer un token de la respuesta
 - `token_name`: Nombre con el que se guardará el token extraído
 - `data_source`: Nombre de la fuente de datos a utilizar
-- `threads_per_second`: Número de hilos por segundo específico para este servicio (opcional, si no se especifica se usa el valor global)
+- `threads_per_second`: Número de hilos por segundo específico para este servicio (para compatibilidad con versiones anteriores)
+- `min_threads`: Número mínimo de hilos al iniciar para este servicio (sobreescribe el valor global)
+- `max_threads`: Número máximo de hilos a alcanzar para este servicio (sobreescribe el valor global)
 
 #### Fuentes de Datos
 
@@ -169,6 +199,30 @@ data_sources:
   - `path`: Ruta del archivo CSV
   - `delimiter`: Delimitador del archivo CSV
   - `has_header`: Indica si el archivo CSV tiene cabecera
+
+> **Nota**: Si el número de hilos es mayor que el número de registros disponibles en la fuente de datos, GMeter reciclará los datos automáticamente, comenzando desde el primer registro una vez que se hayan utilizado todos.
+
+### Funciones en Plantillas
+
+GMeter soporta las siguientes funciones en las plantillas:
+
+- `{{uuid}}`: Genera un UUID v4 único para cada solicitud. Útil para identificadores de correlación, IDs de solicitud, etc.
+
+Ejemplos de uso:
+
+```yaml
+headers:
+  X-Request-ID: "{{uuid}}"  # Generar un UUID para la cabecera
+
+body: |
+  {
+    "request_id": "{{uuid}}",  # Generar un UUID para el cuerpo
+    "username": "{{.username}}"
+  }
+
+form_data_template:
+  request_id: "{{uuid}}"  # Generar un UUID para un campo de formulario
+```
 
 ## Sistema de Logs
 
@@ -184,6 +238,47 @@ La configuración de logs se puede ajustar mediante parámetros de línea de com
 ```bash
 ./gmeter --log-level debug --log-max-size 5 --log-max-backups 3 --log-max-age 7
 ```
+
+## Variables de Entorno y Secretos
+
+GMeter permite usar variables de entorno para almacenar información sensible como credenciales, tokens y URLs, evitando que estos datos se incluyan directamente en los archivos de configuración.
+
+### Uso de Variables de Entorno
+
+1. Crea un archivo `.env` en el directorio raíz del proyecto (puedes usar `.env.example` como plantilla)
+2. Define tus variables en el formato `NOMBRE=valor`
+3. En el archivo de configuración YAML, usa la sintaxis `{{nombre_variable}}` para referenciar las variables
+
+Ejemplo de archivo `.env`:
+```
+oauth2_client_id=mi_client_id_real
+oauth2_client_secret=mi_client_secret_real
+api_key=mi_api_key_real
+```
+
+Ejemplo de uso en `gmeter.yaml`:
+```yaml
+services:
+  - name: "auth"
+    url: "https://api.ejemplo.com/oauth/token"
+    method: "POST"
+    headers:
+      Content-Type: "application/x-www-form-urlencoded"
+    content_type: "form"
+    form_data:
+      grant_type: "client_credentials"
+      client_id: "{{oauth2_client_id}}"
+      client_secret: "{{oauth2_client_secret}}"
+```
+
+### Ventajas
+
+- Mantiene los secretos fuera del control de versiones
+- Permite diferentes configuraciones para distintos entornos
+- Mejora la seguridad al no exponer información sensible
+- Facilita la integración con sistemas de CI/CD
+
+> **Nota**: Asegúrate de añadir el archivo `.env` a tu `.gitignore` para evitar que se suba al repositorio.
 
 ## Reportes
 
@@ -210,4 +305,49 @@ Este proyecto está licenciado bajo la licencia MIT - ver el archivo [LICENSE](L
 
 ## Contribuir
 
-Las contribuciones son bienvenidas. Por favor, abre un issue o un pull request para contribuir al proyecto. 
+Las contribuciones son bienvenidas. Por favor, abre un issue o un pull request para contribuir al proyecto.
+
+### Rampa de hilos (Thread Ramping)
+
+GMeter soporta la rampa gradual de hilos, permitiendo comenzar las pruebas con un número mínimo de hilos e ir aumentando gradualmente hasta un número máximo durante el tiempo de rampa especificado.
+
+#### Configuración de la rampa
+
+Para configurar una rampa de hilos:
+
+1. Define el número mínimo de hilos con el parámetro `min_threads` (global o por servicio)
+2. Define el número máximo de hilos con el parámetro `max_threads` (global o por servicio)
+3. Establece el tiempo de rampa con el parámetro `ramp_up`
+
+Ejemplo de configuración:
+
+```yaml
+global:
+  min_threads: 5          # Iniciar con 5 hilos
+  max_threads: 20         # Aumentar hasta 20 hilos
+  duration: "1m"          # Duración total de la prueba
+  ramp_up: "10s"          # Tiempo para aumentar de 5 a 20 hilos
+
+services:
+  - name: "auth"
+    url: "https://api.example.com/auth"
+    method: "POST"
+    min_threads: 1        # El servicio de auth siempre usa solo 1 hilo
+    max_threads: 1
+
+  - name: "get_profile"
+    url: "https://api.example.com/profile"
+    method: "GET"
+    min_threads: 2        # Iniciar con 2 hilos
+    max_threads: 10       # Aumentar hasta 10 hilos durante los 10s de rampa
+```
+
+#### Comportamiento de la rampa
+
+1. **Fase inicial**: GMeter inicia `min_threads` hilos inmediatamente.
+2. **Fase de rampa**: Durante el tiempo de `ramp_up`, GMeter va aumentando gradualmente el número de hilos hasta llegar a `max_threads`.
+3. **Fase estable**: Una vez alcanzado el número máximo de hilos, GMeter mantiene este nivel hasta que finalice la prueba.
+
+Si `min_threads` y `max_threads` son iguales, o si `ramp_up` es cero, todos los hilos se inician inmediatamente sin rampa.
+
+> **Nota**: Para compatibilidad con versiones anteriores, si solo se define `threads_per_second`, GMeter lo usará como valor tanto para `min_threads` como para `max_threads`. 

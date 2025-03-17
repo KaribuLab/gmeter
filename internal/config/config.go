@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 
+	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
 )
 
@@ -15,11 +18,16 @@ type Config struct {
 	GlobalConfig RunConfig  `mapstructure:"global"`
 	Services     []*Service `mapstructure:"services"`
 	DataSources  DataSource `mapstructure:"data_sources"`
+
+	// Configuración original para reportes (sin reemplazar variables)
+	OriginalConfig string
 }
 
 // RunConfig representa la configuración de ejecución
 type RunConfig struct {
-	ThreadsPerSecond int    `mapstructure:"threads_per_second"`
+	ThreadsPerSecond int    `mapstructure:"threads_per_second"` // Para compatibilidad con versiones anteriores
+	MinThreads       int    `mapstructure:"min_threads"`        // Número mínimo de hilos al iniciar
+	MaxThreads       int    `mapstructure:"max_threads"`        // Número máximo de hilos a alcanzar
 	Duration         string `mapstructure:"duration"`
 	RampUp           string `mapstructure:"ramp_up"`
 }
@@ -30,13 +38,17 @@ type Service struct {
 	URL              string            `mapstructure:"url"`
 	Method           string            `mapstructure:"method"`
 	Headers          map[string]string `mapstructure:"headers"`
-	Body             string            `mapstructure:"body"`
-	BodyTemplate     string            `mapstructure:"body_template"`
+	Body             string            `mapstructure:"body"`               // Cuerpo de la solicitud (puede contener plantillas)
+	FormData         map[string]string `mapstructure:"form_data"`          // Datos para peticiones form-urlencoded
+	FormDataTemplate map[string]string `mapstructure:"form_data_template"` // Plantilla para datos form-urlencoded
+	ContentType      string            `mapstructure:"content_type"`       // Tipo de contenido: json, form
 	DependsOn        string            `mapstructure:"depends_on"`
 	ExtractToken     string            `mapstructure:"extract_token"`
 	TokenName        string            `mapstructure:"token_name"`
 	DataSourceName   string            `mapstructure:"data_source"`
-	ThreadsPerSecond int               `mapstructure:"threads_per_second"`
+	ThreadsPerSecond int               `mapstructure:"threads_per_second"` // Para compatibilidad con versiones anteriores
+	MinThreads       int               `mapstructure:"min_threads"`        // Número mínimo de hilos al iniciar
+	MaxThreads       int               `mapstructure:"max_threads"`        // Número máximo de hilos a alcanzar
 }
 
 // DataSource representa las fuentes de datos para las pruebas
@@ -53,6 +65,9 @@ type CSVSource struct {
 
 // LoadConfig carga la configuración desde un archivo
 func LoadConfig(cfgFile string) (*Config, error) {
+	// Cargar variables de entorno desde .env si existe
+	_ = godotenv.Load() // Ignoramos el error si el archivo no existe
+
 	v := viper.New()
 
 	// Configuración por defecto
@@ -79,6 +94,13 @@ func LoadConfig(cfgFile string) (*Config, error) {
 		return nil, fmt.Errorf("error al leer el archivo de configuración: %w", err)
 	}
 
+	// Guardar la configuración original para reportes
+	configPath := v.ConfigFileUsed()
+	originalConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("error al leer el archivo de configuración original: %w", err)
+	}
+
 	// Crear el directorio de reportes si no existe
 	reportDir := v.GetString("report_dir")
 	if reportDir != "" {
@@ -93,6 +115,14 @@ func LoadConfig(cfgFile string) (*Config, error) {
 		return nil, fmt.Errorf("error al parsear la configuración: %w", err)
 	}
 
+	// Guardar la configuración original
+	cfg.OriginalConfig = string(originalConfig)
+
+	// Reemplazar variables de entorno en la configuración
+	if err := replaceEnvVars(&cfg); err != nil {
+		return nil, fmt.Errorf("error al reemplazar variables de entorno: %w", err)
+	}
+
 	// Validar la configuración
 	if err := validateConfig(&cfg); err != nil {
 		return nil, err
@@ -101,10 +131,97 @@ func LoadConfig(cfgFile string) (*Config, error) {
 	return &cfg, nil
 }
 
+// replaceEnvVars reemplaza las referencias a variables de entorno en la configuración
+func replaceEnvVars(cfg *Config) error {
+	// Patrón para detectar referencias a variables de entorno: {{variable}}
+	pattern := regexp.MustCompile(`\{\{([^{}]+)\}\}`)
+
+	// Función para reemplazar una variable en un string
+	replaceVar := func(s string) string {
+		return pattern.ReplaceAllStringFunc(s, func(match string) string {
+			// Extraer el nombre de la variable (quitar {{ y }})
+			varName := strings.TrimSpace(match[2 : len(match)-2])
+
+			// Obtener el valor de la variable de entorno
+			value := os.Getenv(varName)
+			if value == "" {
+				// Si no se encuentra, devolver la referencia original
+				return match
+			}
+			return value
+		})
+	}
+
+	// Reemplazar variables en los servicios
+	for _, service := range cfg.Services {
+		// Reemplazar en URL
+		service.URL = replaceVar(service.URL)
+
+		// Reemplazar en Body
+		service.Body = replaceVar(service.Body)
+
+		// Reemplazar en Headers
+		for key, value := range service.Headers {
+			service.Headers[key] = replaceVar(value)
+		}
+
+		// Reemplazar en FormData
+		for key, value := range service.FormData {
+			service.FormData[key] = replaceVar(value)
+		}
+
+		// Reemplazar en FormDataTemplate
+		for key, value := range service.FormDataTemplate {
+			service.FormDataTemplate[key] = replaceVar(value)
+		}
+	}
+
+	return nil
+}
+
 // validateConfig valida la configuración
 func validateConfig(cfg *Config) error {
 	if len(cfg.Services) == 0 {
 		return fmt.Errorf("no se han definido servicios")
+	}
+
+	// Validar límites de hilos por segundo global
+	if cfg.GlobalConfig.ThreadsPerSecond < 1 {
+		cfg.GlobalConfig.ThreadsPerSecond = 1 // Mínimo 1 hilo por segundo
+	} else if cfg.GlobalConfig.ThreadsPerSecond > 1000 {
+		cfg.GlobalConfig.ThreadsPerSecond = 1000 // Máximo 1000 hilos por segundo
+	}
+
+	// Validar configuración de min/max hilos global
+	if cfg.GlobalConfig.MinThreads == 0 && cfg.GlobalConfig.MaxThreads == 0 {
+		// Si no se especifican, usar ThreadsPerSecond para ambos (comportamiento tradicional)
+		cfg.GlobalConfig.MinThreads = cfg.GlobalConfig.ThreadsPerSecond
+		cfg.GlobalConfig.MaxThreads = cfg.GlobalConfig.ThreadsPerSecond
+	} else {
+		// Validar min_threads
+		if cfg.GlobalConfig.MinThreads < 1 {
+			cfg.GlobalConfig.MinThreads = 1 // Mínimo 1 hilo
+		} else if cfg.GlobalConfig.MinThreads > 1000 {
+			cfg.GlobalConfig.MinThreads = 1000 // Máximo 1000 hilos
+		}
+
+		// Validar max_threads
+		if cfg.GlobalConfig.MaxThreads < 1 {
+			cfg.GlobalConfig.MaxThreads = 1 // Mínimo 1 hilo
+		} else if cfg.GlobalConfig.MaxThreads > 1000 {
+			cfg.GlobalConfig.MaxThreads = 1000 // Máximo 1000 hilos
+		}
+
+		// Asegurar que min <= max
+		if cfg.GlobalConfig.MinThreads > cfg.GlobalConfig.MaxThreads {
+			cfg.GlobalConfig.MinThreads = cfg.GlobalConfig.MaxThreads
+		}
+
+		// Si ThreadsPerSecond está configurado pero min/max no, usar ese valor
+		if cfg.GlobalConfig.ThreadsPerSecond > 0 && cfg.GlobalConfig.MinThreads == 0 && cfg.GlobalConfig.MaxThreads == 0 {
+			cfg.GlobalConfig.MinThreads = cfg.GlobalConfig.ThreadsPerSecond
+			cfg.GlobalConfig.MaxThreads = cfg.GlobalConfig.ThreadsPerSecond
+		}
 	}
 
 	// Validar que los servicios tengan nombre y URL
@@ -117,6 +234,51 @@ func validateConfig(cfg *Config) error {
 		}
 		if svc.Method == "" {
 			svc.Method = "GET" // Método por defecto
+		}
+
+		// Validar límites de hilos por segundo por servicio
+		if svc.ThreadsPerSecond < 0 {
+			svc.ThreadsPerSecond = 0 // 0 significa usar el valor global
+		} else if svc.ThreadsPerSecond > 1000 {
+			svc.ThreadsPerSecond = 1000 // Máximo 1000 hilos por segundo
+		}
+
+		// Validar configuración de min/max hilos por servicio
+		if svc.MinThreads == 0 && svc.MaxThreads == 0 {
+			// Si no se especifican, usar los valores globales o ThreadsPerSecond
+			if svc.ThreadsPerSecond > 0 {
+				svc.MinThreads = svc.ThreadsPerSecond
+				svc.MaxThreads = svc.ThreadsPerSecond
+			} else {
+				svc.MinThreads = cfg.GlobalConfig.MinThreads
+				svc.MaxThreads = cfg.GlobalConfig.MaxThreads
+			}
+		} else {
+			// Validar min_threads
+			if svc.MinThreads < 0 {
+				svc.MinThreads = 0 // 0 significa usar el valor global
+			} else if svc.MinThreads > 1000 {
+				svc.MinThreads = 1000 // Máximo 1000 hilos
+			}
+
+			// Validar max_threads
+			if svc.MaxThreads < 0 {
+				svc.MaxThreads = 0 // 0 significa usar el valor global
+			} else if svc.MaxThreads > 1000 {
+				svc.MaxThreads = 1000 // Máximo 1000 hilos
+			}
+
+			// Asegurar que min <= max
+			if svc.MinThreads > 0 && svc.MaxThreads > 0 && svc.MinThreads > svc.MaxThreads {
+				svc.MinThreads = svc.MaxThreads
+			}
+
+			// Si solo se especifica uno de los dos, derivar el otro
+			if svc.MinThreads > 0 && svc.MaxThreads == 0 {
+				svc.MaxThreads = svc.MinThreads
+			} else if svc.MinThreads == 0 && svc.MaxThreads > 0 {
+				svc.MinThreads = svc.MaxThreads
+			}
 		}
 
 		// Validar que el servicio dependiente exista
@@ -188,12 +350,12 @@ services:
     method: "POST"
     headers:
       Content-Type: "application/json"
-    body_template: |
+    body: |
       {
         "username": "{{.username}}",
         "password": "{{.password}}"
       }
-    extract_token: "$.token"
+    extract_token: "token"
     token_name: "auth_token"
     data_source: "users"
     threads_per_second: 1  # Solo necesitamos un hilo para autenticación
@@ -213,7 +375,7 @@ services:
     headers:
       Content-Type: "application/json"
       Authorization: "Bearer {{.auth_token}}"
-    body_template: |
+    body: |
       {
         "name": "{{.name}}",
         "email": "{{.email}}",

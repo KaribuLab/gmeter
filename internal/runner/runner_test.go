@@ -79,13 +79,22 @@ func TestLoadDataSources(t *testing.T) {
 
 	// Verificar que se han cargado los datos
 	assert.Contains(t, runner.DataSource, "users", "La fuente de datos 'users' no existe")
-	assert.Len(t, runner.DataSource["users"], 2, "La fuente de datos 'users' debería tener 2 registros")
+
+	// Comprobar el tipo de los datos cargados
+	lazyDataSource, ok := runner.DataSource["users"].(*LazyDataSource)
+	require.True(t, ok, "La fuente de datos 'users' no es del tipo *LazyDataSource")
+	assert.Equal(t, 2, lazyDataSource.Len(), "La fuente de datos 'users' debería tener 2 registros")
 
 	// Verificar el contenido de los registros
-	assert.Equal(t, "user1", runner.DataSource["users"][0]["username"], "El username del primer registro no coincide")
-	assert.Equal(t, "pass1", runner.DataSource["users"][0]["password"], "El password del primer registro no coincide")
-	assert.Equal(t, "user2", runner.DataSource["users"][1]["username"], "El username del segundo registro no coincide")
-	assert.Equal(t, "pass2", runner.DataSource["users"][1]["password"], "El password del segundo registro no coincide")
+	record1, err := lazyDataSource.Get(0)
+	require.NoError(t, err, "Error al obtener el primer registro")
+	assert.Equal(t, "user1", record1["username"], "El username del primer registro no coincide")
+	assert.Equal(t, "pass1", record1["password"], "El password del primer registro no coincide")
+
+	record2, err := lazyDataSource.Get(1)
+	require.NoError(t, err, "Error al obtener el segundo registro")
+	assert.Equal(t, "user2", record2["username"], "El username del segundo registro no coincide")
+	assert.Equal(t, "pass2", record2["password"], "El password del segundo registro no coincide")
 }
 
 func TestExecuteService(t *testing.T) {
