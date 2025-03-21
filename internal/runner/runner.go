@@ -6,11 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -24,7 +22,6 @@ import (
 	"github.com/KaribuLab/gmeter/internal/models"
 	"github.com/KaribuLab/gmeter/internal/reporter"
 	"github.com/google/uuid"
-	"github.com/natefinch/lumberjack"
 	"github.com/tidwall/gjson"
 )
 
@@ -42,66 +39,68 @@ type Runner struct {
 	WaitGroup      sync.WaitGroup
 	StartTime      time.Time
 	EndTime        time.Time
-	StopChan       chan struct{} // Canal para señalizar la terminación
+	StopChan       chan struct{}            // Canal para señalizar la terminación
+	GlobalTokens   *models.GlobalTokenStore // Almacén global de tokens
 }
 
-// NewRunner crea un nuevo ejecutor de pruebas
+// NewRunner crea un nuevo runner
 func NewRunner(cfg *config.Config, log *logger.Logger) *Runner {
-	// Un escritor para las respuestas HTTP
-	var responseWriter io.Writer = ioutil.Discard // Por defecto, descartar las respuestas
-	var bufferedWriter *bufio.Writer
-
-	// Canal para escritura asíncrona de logs, con buffer para evitar bloqueos
-	responseLogCh := make(chan string, 1000)
-	stopLogCh := make(chan struct{})
-
-	// Inicializar el escritor de respuestas si se ha configurado un archivo
-	if cfg.ResponseLogFile != "" {
-		log.Infof("Configurando archivo de respuestas en: %s", cfg.ResponseLogFile)
-
-		// Asegurarse de que el directorio del archivo de log exista
-		dir := filepath.Dir(cfg.ResponseLogFile)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			log.Errorf("Error al crear el directorio para el archivo de respuestas: %v", err)
-		}
-
-		// Configurar el escritor con rotación
-		fileWriter := &lumberjack.Logger{
-			Filename:   cfg.ResponseLogFile,
-			MaxSize:    10,   // 10 MB
-			MaxBackups: 5,    // 5 archivos de respaldo
-			MaxAge:     30,   // 30 días
-			Compress:   true, // Comprimir los archivos rotados
-		}
-
-		// Crear un escritor con buffer para mejorar el rendimiento
-		bufferedWriter = bufio.NewWriterSize(fileWriter, 4096) // Buffer de 4KB
-		responseWriter = bufferedWriter
-
-		log.Infof("Archivo de respuestas configurado exitosamente: %s", cfg.ResponseLogFile)
-	} else {
-		log.Warn("No se configuró archivo para respuestas HTTP (response_log_file)")
+	// Crear el cliente HTTP con timeout
+	client := &http.Client{
+		Timeout: 30 * time.Second, // Timeout por defecto
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     90 * time.Second,
+		},
 	}
 
-	r := &Runner{
+	// Si se especificó un timeout en la configuración global, usarlo
+	if cfg.GlobalConfig.Duration != "" {
+		if timeout, err := time.ParseDuration(cfg.GlobalConfig.Duration); err == nil {
+			client.Timeout = timeout * 2 // El timeout del cliente HTTP es el doble de la duración de la prueba
+		}
+	}
+
+	// Si se especificó un timeout específico para los servicios, usarlo
+	if cfg.GlobalConfig.Duration != "" {
+		if timeout, err := time.ParseDuration(cfg.GlobalConfig.Duration); err == nil {
+			client.Timeout = timeout * 2 // El timeout del cliente HTTP es el doble de la duración de la prueba
+		}
+	}
+
+	// Abrir el archivo de log de respuestas si está configurado
+	var responseWriter io.Writer
+	var bufferedWriter *bufio.Writer
+	if cfg.ResponseLogFile != "" {
+		// Crear o truncar el archivo
+		file, err := os.OpenFile(cfg.ResponseLogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			log.WithError(err).Error("Error al abrir el archivo de log de respuestas")
+		} else {
+			// Configurar un buffer de escritura para mejorar el rendimiento
+			bufferedWriter = bufio.NewWriterSize(file, 1024*1024) // 1MB buffer
+			responseWriter = bufferedWriter
+		}
+	}
+
+	// Obtener la instancia del almacén global de tokens
+	globalTokens := models.GetGlobalTokenStore()
+
+	return &Runner{
 		Config:         cfg,
 		Logger:         log,
 		ResponseWriter: responseWriter,
 		bufferedWriter: bufferedWriter,
-		responseLogCh:  responseLogCh,
-		stopLogCh:      stopLogCh,
-		Client:         &http.Client{},
-		Results:        make(chan *models.Response, 100),
+		responseLogCh:  make(chan string, 1000), // Buffer grande para evitar bloqueos
+		stopLogCh:      make(chan struct{}),
+		Client:         client,
+		Results:        make(chan *models.Response, 1000), // Buffer grande para evitar bloqueos
 		DataSource:     make(map[string]interface{}),
+		WaitGroup:      sync.WaitGroup{},
 		StopChan:       make(chan struct{}),
+		GlobalTokens:   globalTokens,
 	}
-
-	// Iniciar goroutine para escritura asíncrona si hay un archivo configurado
-	if cfg.ResponseLogFile != "" {
-		go r.processResponseLogs()
-	}
-
-	return r
 }
 
 // processResponseLogs procesa asíncronamente los logs de respuestas
@@ -142,6 +141,11 @@ func (r *Runner) Run() error {
 	// Iniciar el recolector de resultados
 	resultCollector := make(chan *models.TestResult)
 	go r.collectResults(resultCollector)
+
+	// Si tenemos un ResponseWriter, iniciar el procesador de logs de respuestas
+	if r.ResponseWriter != nil {
+		go r.processResponseLogs()
+	}
 
 	// Si tenemos un bufferedWriter, iniciamos una goroutine para vaciarlo periódicamente
 	if r.bufferedWriter != nil {
@@ -638,38 +642,67 @@ func (r *Runner) runServiceThread(id int, service *config.Service) {
 			}
 		}
 
-		// Ejecutar el servicio dependiente para obtener el token
-		depResp, err := r.executeService(dependentService, tempThreadContext)
-		if err != nil {
-			r.Logger.WithError(err).Errorf("Error al ejecutar el servicio dependiente %s", dependentService.Name)
-			return
+		cachedDependency := false
+
+		if dependentService.CacheToken {
+			// Comprobar si el token existe y si ha expirado
+			if token, ok := models.GetGlobalTokenStore().GetToken(dependentService.TokenName); ok {
+				tempThreadContext.TokenStore.SetToken(dependentService.TokenName, token)
+				cachedDependency = true
+			} else {
+				r.Logger.Warnf("No se pudo obtener el token para %s", dependentService.TokenName)
+			}
 		}
 
-		// Si el servicio extrae un token, guardarlo
-		if dependentService.ExtractToken != "" && dependentService.TokenName != "" {
-			// Parsear la respuesta como JSON
-			if depResp.Body != nil {
-				// Extraer el token usando gjson
-				token := gjson.GetBytes(depResp.Body, dependentService.ExtractToken).String()
-				if token != "" {
-					// Si se ha configurado la caché con tiempo de expiración
-					if dependentService.CacheToken && dependentService.TokenExpiry != "" {
-						expiryDuration, err := time.ParseDuration(dependentService.TokenExpiry)
-						if err != nil {
-							r.Logger.Warnf("Error al parsear la duración de expiración del token para %s: %v", dependentService.TokenName, err)
-							// Si hay error, usar SetToken normal
-							tempThreadContext.TokenStore.SetToken(dependentService.TokenName, token)
+		if !cachedDependency {
+			// Ejecutar el servicio dependiente para obtener el token
+			depResp, err := r.executeService(dependentService, tempThreadContext)
+			if err != nil {
+				r.Logger.WithError(err).Errorf("Error al ejecutar el servicio dependiente %s", dependentService.Name)
+				return
+			}
+
+			// Si el servicio extrae un token, guardarlo
+			if dependentService.ExtractToken != "" && dependentService.TokenName != "" {
+				// Parsear la respuesta como JSON
+				if depResp.Body != nil {
+					// Extraer el token usando gjson
+					token := gjson.GetBytes(depResp.Body, dependentService.ExtractToken).String()
+					if token != "" {
+						// Si se ha configurado la caché con tiempo de expiración
+						if dependentService.CacheToken && dependentService.TokenExpiry != "" {
+							expiryDuration, err := time.ParseDuration(dependentService.TokenExpiry)
+							if err != nil {
+								r.Logger.Warnf("Error al parsear la duración de expiración del token para %s: %v", dependentService.TokenName, err)
+								// Si hay error, usar SetToken normal
+								tempThreadContext.TokenStore.SetToken(dependentService.TokenName, token)
+								// También establecer en el almacén global si es un servicio de autenticación
+								if dependentService.IsAuthService {
+									models.GetGlobalTokenStore().SetToken(dependentService.TokenName, token)
+									r.Logger.Infof("Token de autenticación global actualizado para %s", dependentService.TokenName)
+								}
+							} else {
+								tempThreadContext.TokenStore.SetTokenWithExpiry(dependentService.TokenName, token, expiryDuration)
+								// También establecer en el almacén global si es un servicio de autenticación
+								if dependentService.IsAuthService {
+									models.GetGlobalTokenStore().SetTokenWithExpiry(dependentService.TokenName, token, expiryDuration)
+									r.Logger.Infof("Token de autenticación global actualizado para %s con expiración de %s", dependentService.TokenName, dependentService.TokenExpiry)
+								}
+								r.Logger.Debugf("Token actualizado para %s con expiración de %s", dependentService.TokenName, dependentService.TokenExpiry)
+							}
 						} else {
-							tempThreadContext.TokenStore.SetTokenWithExpiry(dependentService.TokenName, token, expiryDuration)
-							r.Logger.Debugf("Token extraído para %s con expiración de %s", dependentService.TokenName, dependentService.TokenExpiry)
+							// Comportamiento estándar sin caché con tiempo
+							tempThreadContext.TokenStore.SetToken(dependentService.TokenName, token)
+							// También establecer en el almacén global si es un servicio de autenticación
+							if dependentService.IsAuthService {
+								models.GetGlobalTokenStore().SetToken(dependentService.TokenName, token)
+								r.Logger.Infof("Token de autenticación global actualizado para %s", dependentService.TokenName)
+							}
+							r.Logger.Debugf("Token actualizado para el servicio dependiente %s: %s", dependentService.TokenName, token)
 						}
 					} else {
-						// Comportamiento estándar sin caché con tiempo
-						tempThreadContext.TokenStore.SetToken(dependentService.TokenName, token)
-						r.Logger.Debugf("Token extraído para el servicio dependiente %s: %s", dependentService.TokenName, token)
+						r.Logger.Warnf("No se pudo extraer el token para %s", dependentService.TokenName)
 					}
-				} else {
-					r.Logger.Warnf("No se pudo extraer el token para %s", dependentService.TokenName)
 				}
 			}
 		}
@@ -768,11 +801,22 @@ func (r *Runner) runServiceThread(id int, service *config.Service) {
 					// Verificar si necesitamos actualizar el token
 					tokenNeedsUpdate := true
 
-					// Si el token tiene caché con tiempo de expiración, verificar si ha expirado
-					if dependentService.CacheToken && dependentService.TokenName != "" {
-						// Comprobar si el token existe y si ha expirado
+					// Primero verificamos si es un servicio de autenticación con token global
+					if dependentService.IsAuthService && dependentService.TokenName != "" {
+						// Comprobar si el token existe y si ha expirado en el almacén global
+						if !models.GetGlobalTokenStore().IsTokenExpired(dependentService.TokenName) {
+							// El token global no ha expirado, no necesita actualización
+							tokenNeedsUpdate = false
+							r.Logger.Debugf("Usando token global para %s que no ha expirado", dependentService.TokenName)
+						} else {
+							r.Logger.Debugf("Token global para %s ha expirado o no existe, actualizando", dependentService.TokenName)
+						}
+					} else if dependentService.CacheToken && dependentService.TokenName != "" {
+						// Si no es un servicio de autenticación global o el token global ha expirado,
+						// verificamos el token local del hilo
+						// Comprobar si el token local existe y si ha expirado
 						if !threadContext.TokenStore.IsTokenExpired(dependentService.TokenName) {
-							// El token no ha expirado, no necesita actualización
+							// El token local no ha expirado, no necesita actualización
 							tokenNeedsUpdate = false
 						} else {
 							r.Logger.Debugf("Token para %s ha expirado, actualizando", dependentService.TokenName)
@@ -800,13 +844,28 @@ func (r *Runner) runServiceThread(id int, service *config.Service) {
 										r.Logger.Warnf("Error al parsear la duración de expiración del token para %s: %v", dependentService.TokenName, err)
 										// Si hay error, usar SetToken normal
 										threadContext.TokenStore.SetToken(dependentService.TokenName, token)
+										// También establecer en el almacén global si es un servicio de autenticación
+										if dependentService.IsAuthService {
+											models.GetGlobalTokenStore().SetToken(dependentService.TokenName, token)
+											r.Logger.Infof("Token de autenticación global actualizado para %s", dependentService.TokenName)
+										}
 									} else {
 										threadContext.TokenStore.SetTokenWithExpiry(dependentService.TokenName, token, expiryDuration)
+										// También establecer en el almacén global si es un servicio de autenticación
+										if dependentService.IsAuthService {
+											models.GetGlobalTokenStore().SetTokenWithExpiry(dependentService.TokenName, token, expiryDuration)
+											r.Logger.Infof("Token de autenticación global actualizado para %s con expiración de %s", dependentService.TokenName, dependentService.TokenExpiry)
+										}
 										r.Logger.Debugf("Token actualizado para %s con expiración de %s", dependentService.TokenName, dependentService.TokenExpiry)
 									}
 								} else {
 									// Comportamiento estándar sin caché con tiempo
 									threadContext.TokenStore.SetToken(dependentService.TokenName, token)
+									// También establecer en el almacén global si es un servicio de autenticación
+									if dependentService.IsAuthService {
+										models.GetGlobalTokenStore().SetToken(dependentService.TokenName, token)
+										r.Logger.Infof("Token de autenticación global actualizado para %s", dependentService.TokenName)
+									}
 									r.Logger.Debugf("Token actualizado para el servicio dependiente %s: %s", dependentService.TokenName, token)
 								}
 							}
@@ -839,8 +898,15 @@ func (r *Runner) runServiceThread(id int, service *config.Service) {
 							r.Logger.Warnf("Error al parsear la duración de expiración del token para %s: %v", service.TokenName, err)
 							// Si hay error, usar SetToken normal
 							threadContext.TokenStore.SetToken(service.TokenName, token)
+							// También guardar en el almacén global para compartir entre hilos
+							r.GlobalTokens.SetToken(service.TokenName, token)
+							r.Logger.Infof("Token global actualizado para %s", service.TokenName)
 						} else {
 							threadContext.TokenStore.SetTokenWithExpiry(service.TokenName, token, expiryDuration)
+							// También guardar en el almacén global para compartir entre hilos
+							r.GlobalTokens.SetTokenWithExpiry(service.TokenName, token, expiryDuration)
+							r.Logger.Infof("Token global actualizado para %s con expiración de %s", service.TokenName, service.TokenExpiry)
+
 							if executionCount == 1 || executionCount%100 == 0 {
 								r.Logger.Infof("Token extraído para %s con expiración de %s", service.TokenName, service.TokenExpiry)
 							} else {
@@ -850,6 +916,10 @@ func (r *Runner) runServiceThread(id int, service *config.Service) {
 					} else {
 						// Comportamiento estándar sin caché con tiempo
 						threadContext.TokenStore.SetToken(service.TokenName, token)
+						// También guardar en el almacén global para compartir entre hilos
+						r.GlobalTokens.SetToken(service.TokenName, token)
+						r.Logger.Infof("Token global actualizado para %s", service.TokenName)
+
 						if executionCount == 1 || executionCount%100 == 0 {
 							// Solo mostrar el token en la primera ejecución o cada 100 ejecuciones para no saturar los logs
 							r.Logger.Infof("Token extraído para %s: %s", service.TokenName, token)
@@ -940,7 +1010,14 @@ func (r *Runner) executeService(service *config.Service, ctx *models.ThreadConte
 						data[k] = v
 					}
 
-					// Agregar los tokens
+					// Buscar primero en el almacén global de tokens
+					// Esto permite que todos los hilos compartan los tokens
+					for k, v := range r.GlobalTokens.Tokens {
+						data[k] = v
+					}
+
+					// Luego agregar los tokens del almacén local del hilo
+					// Esto permite que los tokens locales sobrescriban los globales
 					for k, v := range ctx.TokenStore.Tokens {
 						data[k] = v
 					}
@@ -1006,7 +1083,14 @@ func (r *Runner) executeService(service *config.Service, ctx *models.ThreadConte
 					data[k] = v
 				}
 
-				// Agregar los tokens
+				// Buscar primero en el almacén global de tokens
+				// Esto permite que todos los hilos compartan los tokens
+				for k, v := range r.GlobalTokens.Tokens {
+					data[k] = v
+				}
+
+				// Luego agregar los tokens del almacén local del hilo
+				// Esto permite que los tokens locales sobrescriban los globales
 				for k, v := range ctx.TokenStore.Tokens {
 					data[k] = v
 				}
@@ -1059,7 +1143,14 @@ func (r *Runner) executeService(service *config.Service, ctx *models.ThreadConte
 				data[k] = v
 			}
 
-			// Agregar los tokens
+			// Buscar primero en el almacén global de tokens
+			// Esto permite que todos los hilos compartan los tokens
+			for k, v := range r.GlobalTokens.Tokens {
+				data[k] = v
+			}
+
+			// Luego agregar los tokens del almacén local del hilo
+			// Esto permite que los tokens locales sobrescriban los globales
 			for k, v := range ctx.TokenStore.Tokens {
 				data[k] = v
 			}

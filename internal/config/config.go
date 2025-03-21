@@ -47,8 +47,9 @@ type Service struct {
 	DependsOn        string            `mapstructure:"depends_on"`
 	ExtractToken     string            `mapstructure:"extract_token"`
 	TokenName        string            `mapstructure:"token_name"`
-	CacheToken       bool              `mapstructure:"cache_token"`  // Indica si se debe cachear el token
-	TokenExpiry      string            `mapstructure:"token_expiry"` // Duración de validez del token (ej: "30m", "1h")
+	CacheToken       bool              `mapstructure:"cache_token"`     // Indica si se debe cachear el token
+	TokenExpiry      string            `mapstructure:"token_expiry"`    // Duración de validez del token (ej: "30m", "1h")
+	IsAuthService    bool              `mapstructure:"is_auth_service"` // Indica si este servicio proporciona autenticación global
 	DataSourceName   string            `mapstructure:"data_source"`
 	ThreadsPerSecond int               `mapstructure:"threads_per_second"` // Para compatibilidad con versiones anteriores
 	MinThreads       int               `mapstructure:"min_threads"`        // Número mínimo de hilos al iniciar

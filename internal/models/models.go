@@ -2,6 +2,7 @@ package models
 
 import (
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -78,6 +79,7 @@ type TokenStore struct {
 	Tokens        map[string]string
 	Expiration    map[string]time.Time // Mapa para almacenar las fechas de expiración de los tokens
 	DefaultExpiry time.Duration        // Tiempo de expiración por defecto para los tokens
+	mu            sync.RWMutex
 }
 
 // NewTokenStore crea un nuevo almacén de tokens
@@ -155,9 +157,36 @@ type ThreadContext struct {
 
 // NewThreadContext crea un nuevo contexto de hilo
 func NewThreadContext(id int, data DataRecord) *ThreadContext {
+	// Crear un nuevo TokenStore
+	tokenStore := NewTokenStore()
+
+	// Obtener el almacén global de tokens
+	globalTokens := GetGlobalTokenStore()
+
+	// Si hay tokens en el almacén global, copiarlos al TokenStore local
+	// Esto permite que los nuevos hilos empiecen con los tokens existentes
+	if globalTokens != nil {
+		globalTokens.mutex.RLock()
+		for tokenName, tokenValue := range globalTokens.Tokens {
+			tokenStore.SetToken(tokenName, tokenValue)
+		}
+
+		// También copiar información de expiración si existe
+		for tokenName, expiry := range globalTokens.Expiration {
+			if !expiry.IsZero() {
+				// Verificar si el token ya expiró
+				if time.Now().Before(expiry) {
+					// Solo copiar tokens no expirados
+					tokenStore.Expiration[tokenName] = expiry
+				}
+			}
+		}
+		globalTokens.mutex.RUnlock()
+	}
+
 	return &ThreadContext{
 		ID:            id,
-		TokenStore:    NewTokenStore(),
+		TokenStore:    tokenStore,
 		Data:          data,
 		CorrelationID: generateCorrelationID(),
 	}
