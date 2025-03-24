@@ -60,25 +60,56 @@ type ServiceStats struct {
 	Errors            map[string]int
 }
 
-// TestResult representa el resultado de una prueba completa
+// TestResult almacena los resultados de la prueba de stress
 type TestResult struct {
-	StartTime         time.Time
-	EndTime           time.Time
-	TotalRequests     int
-	SuccessRequests   int
-	FailedRequests    int
-	ServiceStats      map[string]*ServiceStats
-	Config            interface{}
-	MaxActiveThreads  int                  // Número máximo de hilos activos alcanzado
-	ThreadActivity    []ThreadActivityData // Registro de actividad de hilos a lo largo del tiempo
-	StatusCodeSummary map[int]int          // Resumen de códigos de estado HTTP
+	StartTime          time.Time
+	EndTime            time.Time
+	TotalRequests      int
+	SuccessRequests    int
+	FailedRequests     int
+	StatusCodeSummary  map[int]int
+	ServiceStats       map[string]*ServiceStats
+	MaxActiveThreads   int
+	AvgActiveThreads   float64 // Promedio de hilos activos durante la prueba
+	TotalEffectiveTime float64 // Tiempo efectivo de la prueba (segundos)
+	ThreadActivity     []ThreadActivityData
+	Config             interface{}
 }
 
-// ThreadActivityData registra información sobre los hilos activos en un momento dado
+// CalculateAdditionalStats calcula estadísticas adicionales basadas en los datos recopilados
+func (r *TestResult) CalculateAdditionalStats() {
+	// Calcular el promedio de hilos activos
+	totalThreads := 0
+	validSamples := 0
+
+	for _, activity := range r.ThreadActivity {
+		if activity.ActiveThreads > 0 {
+			totalThreads += activity.ActiveThreads
+			validSamples++
+		}
+	}
+
+	if validSamples > 0 {
+		r.AvgActiveThreads = float64(totalThreads) / float64(validSamples)
+	}
+
+	// Calcular el tiempo efectivo de la prueba
+	r.TotalEffectiveTime = r.EndTime.Sub(r.StartTime).Seconds()
+}
+
+// GetEffectiveRequestsPerSecond calcula las solicitudes por segundo efectivas
+func (r *TestResult) GetEffectiveRequestsPerSecond() float64 {
+	if r.TotalEffectiveTime > 0 {
+		return float64(r.TotalRequests) / r.TotalEffectiveTime
+	}
+	return 0
+}
+
+// ThreadActivityData representa los datos de actividad de hilos en un punto en el tiempo
 type ThreadActivityData struct {
-	Timestamp     time.Time // Momento de la medición
-	ActiveThreads int       // Número de hilos activos en ese momento
-	RequestsPS    float64   // Solicitudes por segundo en ese momento
+	Timestamp     time.Time
+	ActiveThreads int
+	RequestsPS    float64
 }
 
 // DataRecord representa un registro de datos para las pruebas

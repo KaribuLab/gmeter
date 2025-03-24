@@ -5,11 +5,13 @@ report_dir: "reports"
 
 # Configuración global
 global:
-  threads_per_second: 5  # Número de hilos por segundo global (para compatibilidad)
-  min_threads: 2         # Número mínimo de hilos al inicio
-  max_threads: 10        # Número máximo de hilos a alcanzar
-  duration: "10s"        # Duración total de la prueba
-  ramp_up: "2s"          # Tiempo de rampa para alcanzar el número total de hilos
+  threads_per_second: 5    # Número de hilos por segundo global (para compatibilidad)
+  min_threads: 2           # Número mínimo de hilos al inicio
+  max_threads: 10          # Número máximo de hilos a alcanzar
+  requests_per_second: 100 # Límite máximo de solicitudes por segundo (0 = sin límite)
+  duration: "10s"          # Duración total de la prueba
+  ramp_up: "2s"            # Tiempo de rampa para alcanzar el número total de hilos
+  batch_size: 5            # Número de hilos a lanzar por lote durante el ramp-up
 
 # Servicios a probar
 services:
@@ -31,6 +33,7 @@ services:
     token_expiry: "1h"  # El token expira después de 1 hora
     min_threads: 1            # Mínimo 1 hilo para autenticación
     max_threads: 1            # Máximo 1 hilo para autenticación
+    requests_per_second: 10   # Límite máximo de 10 solicitudes por segundo para este servicio
 
   - name: "auth_form"
     url: "{{api_base_url}}/oauth2/token"  # URL desde variable de entorno
@@ -59,6 +62,7 @@ services:
     depends_on: "auth"                         # Depende del servicio de autenticación
     min_threads: 2                             # Iniciar con 2 hilos
     max_threads: 10                            # Aumentar hasta 10 hilos durante la rampa
+    requests_per_second: 50   # Límite máximo de 50 solicitudes por segundo para este servicio
 
   - name: "update_profile"
     url: "http://localhost:8080/update"  # URL del servicio de actualización

@@ -27,34 +27,40 @@ type Config struct {
 
 // RunConfig representa la configuración de ejecución
 type RunConfig struct {
-	ThreadsPerSecond int    `mapstructure:"threads_per_second"` // Para compatibilidad con versiones anteriores
-	MinThreads       int    `mapstructure:"min_threads"`        // Número mínimo de hilos al iniciar
-	MaxThreads       int    `mapstructure:"max_threads"`        // Número máximo de hilos a alcanzar
-	BatchSize        int    `mapstructure:"batch_size"`         // Tamaño de los lotes de hilos durante el ramp-up
-	Duration         string `mapstructure:"duration"`
-	RampUp           string `mapstructure:"ramp_up"`
+	ThreadsPerSecond  int    `mapstructure:"threads_per_second"`  // Para compatibilidad con versiones anteriores
+	MinThreads        int    `mapstructure:"min_threads"`         // Número mínimo de hilos al iniciar
+	MaxThreads        int    `mapstructure:"max_threads"`         // Número máximo de hilos a alcanzar
+	BatchSize         int    `mapstructure:"batch_size"`          // Tamaño de los lotes de hilos durante el ramp-up
+	RequestsPerSecond int    `mapstructure:"requests_per_second"` // Límite máximo de solicitudes por segundo
+	Duration          string `mapstructure:"duration"`
+	RampUp            string `mapstructure:"ramp_up"`
 }
 
 // Service representa un servicio HTTP a probar
 type Service struct {
-	Name             string            `mapstructure:"name"`
-	URL              string            `mapstructure:"url"`
-	Method           string            `mapstructure:"method"`
-	Headers          map[string]string `mapstructure:"headers"`
-	Body             string            `mapstructure:"body"`               // Cuerpo de la solicitud (puede contener plantillas)
-	FormData         map[string]string `mapstructure:"form_data"`          // Datos para peticiones form-urlencoded
-	FormDataTemplate map[string]string `mapstructure:"form_data_template"` // Plantilla para datos form-urlencoded
-	ContentType      string            `mapstructure:"content_type"`       // Tipo de contenido: json, form
-	DependsOn        string            `mapstructure:"depends_on"`
-	ExtractToken     string            `mapstructure:"extract_token"`
-	TokenName        string            `mapstructure:"token_name"`
-	CacheToken       bool              `mapstructure:"cache_token"`     // Indica si se debe cachear el token
-	TokenExpiry      string            `mapstructure:"token_expiry"`    // Duración de validez del token (ej: "30m", "1h")
-	IsAuthService    bool              `mapstructure:"is_auth_service"` // Indica si este servicio proporciona autenticación global
-	DataSourceName   string            `mapstructure:"data_source"`
-	ThreadsPerSecond int               `mapstructure:"threads_per_second"` // Para compatibilidad con versiones anteriores
-	MinThreads       int               `mapstructure:"min_threads"`        // Número mínimo de hilos al iniciar
-	MaxThreads       int               `mapstructure:"max_threads"`        // Número máximo de hilos a alcanzar
+	Name              string            `mapstructure:"name"`
+	URL               string            `mapstructure:"url"`
+	Method            string            `mapstructure:"method"`
+	Headers           map[string]string `mapstructure:"headers"`
+	Body              string            `mapstructure:"body"`               // Cuerpo de la solicitud (puede contener plantillas)
+	FormData          map[string]string `mapstructure:"form_data"`          // Datos para peticiones form-urlencoded
+	FormDataTemplate  map[string]string `mapstructure:"form_data_template"` // Plantilla para datos form-urlencoded
+	ContentType       string            `mapstructure:"content_type"`       // Tipo de contenido: json, form
+	DependsOn         string            `mapstructure:"depends_on"`
+	ExtractToken      string            `mapstructure:"extract_token"`
+	TokenName         string            `mapstructure:"token_name"`
+	ExtractVars       map[string]string `mapstructure:"extract_vars"`    // Mapa de variables a extraer (nombre -> regex)
+	CacheToken        bool              `mapstructure:"cache_token"`     // Indica si se debe cachear el token
+	TokenExpiry       string            `mapstructure:"token_expiry"`    // Duración de validez del token (ej: "30m", "1h")
+	IsAuthService     bool              `mapstructure:"is_auth_service"` // Indica si este servicio proporciona autenticación global
+	DataSourceName    string            `mapstructure:"data_source"`
+	ThreadsPerSecond  int               `mapstructure:"threads_per_second"`  // Para compatibilidad con versiones anteriores
+	MinThreads        int               `mapstructure:"min_threads"`         // Número mínimo de hilos al iniciar
+	MaxThreads        int               `mapstructure:"max_threads"`         // Número máximo de hilos a alcanzar
+	RequestsPerSecond int               `mapstructure:"requests_per_second"` // Límite máximo de solicitudes por segundo
+
+	// Campos internos (no se serializan)
+	ProcessedBody string `mapstructure:"-"` // Cuerpo procesado con variables reemplazadas para logging
 }
 
 // DataSource representa las fuentes de datos para las pruebas
@@ -83,7 +89,8 @@ func LoadConfig(cfgFile string) (*Config, error) {
 	v.SetDefault("global.threads_per_second", 10)
 	v.SetDefault("global.duration", "1m")
 	v.SetDefault("global.ramp_up", "10s")
-	v.SetDefault("global.batch_size", 50) // Valor por defecto para el tamaño de lotes
+	v.SetDefault("global.batch_size", 50)         // Valor por defecto para el tamaño de lotes
+	v.SetDefault("global.requests_per_second", 0) // 0 significa sin límite
 
 	// Buscar el archivo de configuración
 	if cfgFile != "" {
@@ -200,6 +207,13 @@ func validateConfig(cfg *Config) error {
 		cfg.GlobalConfig.ThreadsPerSecond = 1000 // Máximo 1000 hilos por segundo
 	}
 
+	// Validar límite de solicitudes por segundo global
+	if cfg.GlobalConfig.RequestsPerSecond < 0 {
+		cfg.GlobalConfig.RequestsPerSecond = 0 // 0 significa sin límite
+	} else if cfg.GlobalConfig.RequestsPerSecond > 10000 {
+		cfg.GlobalConfig.RequestsPerSecond = 10000 // Máximo 10000 solicitudes por segundo
+	}
+
 	// Validar configuración de min/max hilos global
 	if cfg.GlobalConfig.MinThreads == 0 && cfg.GlobalConfig.MaxThreads == 0 {
 		// Si no se especifican, usar ThreadsPerSecond para ambos (comportamiento tradicional)
@@ -260,6 +274,13 @@ func validateConfig(cfg *Config) error {
 			svc.ThreadsPerSecond = 0 // 0 significa usar el valor global
 		} else if svc.ThreadsPerSecond > 1000 {
 			svc.ThreadsPerSecond = 1000 // Máximo 1000 hilos por segundo
+		}
+
+		// Validar límite de solicitudes por segundo por servicio
+		if svc.RequestsPerSecond < 0 {
+			svc.RequestsPerSecond = 0 // 0 significa usar el valor global
+		} else if svc.RequestsPerSecond > 10000 {
+			svc.RequestsPerSecond = 10000 // Máximo 10000 solicitudes por segundo
 		}
 
 		// Validar configuración de min/max hilos por servicio

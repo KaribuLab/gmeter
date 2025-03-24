@@ -1,15 +1,19 @@
 package runner
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"text/template"
 	"time"
 
 	"github.com/KaribuLab/gmeter/internal/config"
@@ -18,31 +22,112 @@ import (
 	"github.com/KaribuLab/gmeter/internal/reporter"
 )
 
+// Runner ejecuta pruebas de stress
 type Runner struct {
-	cfg           *config.Config
-	log           *logger.Logger
-	responseLog   *logger.Logger // Logger específico para las respuestas HTTP
-	client        *http.Client
-	variables     map[string]string // Para almacenar variables extraídas entre solicitudes
-	mutex         sync.RWMutex      // Para acceso seguro a variables compartidas
-	activeThreads int32             // Contador atómico para el número de hilos activos
+	cfg             *config.Config
+	log             *logger.Logger
+	responseLog     *logger.Logger // Logger específico para las respuestas HTTP
+	client          *http.Client
+	variables       map[string]string     // Para almacenar variables extraídas entre solicitudes
+	mutex           sync.RWMutex          // Para acceso seguro a variables compartidas
+	activeThreads   int32                 // Contador atómico para el número de hilos activos
+	csvData         map[string][][]string // Datos cargados desde archivos CSV
+	csvHeaders      map[string][]string   // Encabezados de los archivos CSV
+	csvCurrentIndex int                   // Índice actual para los datos CSV
 
-	// Para almacenar resultados y generar reportes
+	// Variables para limitación de tasa
+	globalRateLimiter   *RateLimiter
+	serviceRateLimiters map[string]*RateLimiter
+
+	// Variables para estadísticas
+	statsMutex sync.Mutex
 	testResult *models.TestResult
-	statsMutex sync.Mutex // Para acceso seguro a las estadísticas
+}
+
+// RateLimiter implementa un limitador de tasa usando el algoritmo token bucket
+type RateLimiter struct {
+	rate       float64   // Tokens por segundo
+	bucketSize int       // Capacidad máxima del bucket
+	tokens     float64   // Tokens actuales en el bucket
+	lastRefill time.Time // Último momento en que se rellenaron tokens
+	mutex      sync.Mutex
+}
+
+// NewRateLimiter crea un nuevo limitador de tasa
+func NewRateLimiter(rate int) *RateLimiter {
+	if rate <= 0 {
+		return nil // Sin limitación
+	}
+
+	return &RateLimiter{
+		rate:       float64(rate),
+		bucketSize: rate,          // El tamaño máximo del bucket es igual a la tasa
+		tokens:     float64(rate), // Inicializar con el bucket lleno
+		lastRefill: time.Now(),
+	}
+}
+
+// Allow verifica si se permite realizar una solicitud
+func (rl *RateLimiter) Allow() bool {
+	if rl == nil {
+		return true // Si no hay limitador, siempre permitir
+	}
+
+	rl.mutex.Lock()
+	defer rl.mutex.Unlock()
+
+	// Rellenar tokens basado en el tiempo transcurrido
+	now := time.Now()
+	elapsed := now.Sub(rl.lastRefill).Seconds()
+	rl.lastRefill = now
+
+	// Añadir tokens basados en el tiempo transcurrido y la tasa
+	rl.tokens += elapsed * rl.rate
+
+	// Limitar al tamaño máximo del bucket
+	if rl.tokens > float64(rl.bucketSize) {
+		rl.tokens = float64(rl.bucketSize)
+	}
+
+	// Verificar si hay suficientes tokens
+	if rl.tokens < 1 {
+		return false // No hay suficientes tokens
+	}
+
+	// Consumir un token
+	rl.tokens--
+	return true
+}
+
+// WaitUntilAllowed espera hasta que haya un token disponible
+func (rl *RateLimiter) WaitUntilAllowed() {
+	if rl == nil {
+		return // Sin limitación, no hay necesidad de esperar
+	}
+
+	for {
+		if rl.Allow() {
+			return
+		}
+		// Esperar un poco antes de intentar de nuevo
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func NewRunner(cfg *config.Config, log *logger.Logger) *Runner {
 	runner := &Runner{
-		cfg:       cfg,
-		log:       log,
-		client:    &http.Client{Timeout: 30 * time.Second},
-		variables: make(map[string]string),
+		cfg:        cfg,
+		log:        log,
+		client:     &http.Client{Timeout: 30 * time.Second},
+		variables:  make(map[string]string),
+		csvData:    make(map[string][][]string),
+		csvHeaders: make(map[string][]string),
 		testResult: &models.TestResult{
 			StartTime:    time.Now(),
 			ServiceStats: make(map[string]*models.ServiceStats),
 			Config:       cfg,
 		},
+		serviceRateLimiters: make(map[string]*RateLimiter),
 	}
 
 	// Inicializar el logger de respuestas si se ha configurado un archivo
@@ -53,7 +138,117 @@ func NewRunner(cfg *config.Config, log *logger.Logger) *Runner {
 		log.Info(fmt.Sprintf("Registrando respuestas HTTP en: %s", cfg.ResponseLogFile))
 	}
 
+	// Cargar datos desde archivos CSV
+	if err := runner.loadCSVData(); err != nil {
+		log.Warn(fmt.Sprintf("Error al cargar datos CSV: %s", err.Error()))
+	}
+
+	// Inicializar limitador de tasa global si está configurado
+	if cfg.GlobalConfig.RequestsPerSecond > 0 {
+		runner.globalRateLimiter = NewRateLimiter(cfg.GlobalConfig.RequestsPerSecond)
+		log.Info(fmt.Sprintf("Limitación global configurada: %d solicitudes por segundo", cfg.GlobalConfig.RequestsPerSecond))
+	}
+
+	// Inicializar limitadores de tasa por servicio si están configurados
+	for _, svc := range cfg.Services {
+		if svc.RequestsPerSecond > 0 {
+			runner.serviceRateLimiters[svc.Name] = NewRateLimiter(svc.RequestsPerSecond)
+			log.Info(fmt.Sprintf("Limitación para servicio %s configurada: %d solicitudes por segundo",
+				svc.Name, svc.RequestsPerSecond))
+		}
+	}
+
 	return runner
+}
+
+// loadCSVData carga los datos desde los archivos CSV configurados
+func (r *Runner) loadCSVData() error {
+	for name, source := range r.cfg.DataSources.CSV {
+		r.log.Info(fmt.Sprintf("Cargando datos CSV desde %s", source.Path))
+
+		// Abrir el archivo CSV
+		file, err := os.Open(source.Path)
+		if err != nil {
+			return fmt.Errorf("error al abrir archivo CSV %s: %w", source.Path, err)
+		}
+		defer file.Close()
+
+		// Configurar el lector CSV
+		delimiter := ','
+		if source.Delimiter != "" {
+			delimiter = rune(source.Delimiter[0])
+		}
+		reader := csv.NewReader(file)
+		reader.Comma = delimiter
+		reader.LazyQuotes = true // Para manejar comillas de manera más flexible
+
+		// Leer todos los registros
+		records, err := reader.ReadAll()
+		if err != nil {
+			return fmt.Errorf("error al leer archivo CSV %s: %w", source.Path, err)
+		}
+
+		// Si no hay registros, continuar con el siguiente archivo
+		if len(records) == 0 {
+			r.log.Warn(fmt.Sprintf("El archivo CSV %s no contiene datos", source.Path))
+			continue
+		}
+
+		// Procesar encabezados si es necesario
+		var headers []string
+		var dataRows [][]string
+
+		if source.HasHeader {
+			// El primer registro son los encabezados
+			headers = records[0]
+			dataRows = records[1:]
+		} else {
+			// Si no hay encabezados, generarlos (col_1, col_2, etc.)
+			headers = make([]string, len(records[0]))
+			for i := range headers {
+				headers[i] = fmt.Sprintf("col_%d", i+1)
+			}
+			dataRows = records
+		}
+
+		// Almacenar los datos
+		r.csvData[name] = dataRows
+		r.csvHeaders[name] = headers
+
+		r.log.Info(fmt.Sprintf("Cargados %d registros desde %s", len(dataRows), source.Path))
+	}
+
+	return nil
+}
+
+// getCSVDataForThread obtiene un registro CSV para un hilo específico
+func (r *Runner) getCSVDataForThread(dataSourceName string, threadNum int) map[string]string {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	data := make(map[string]string)
+
+	// Verificar si la fuente de datos existe
+	rows, ok := r.csvData[dataSourceName]
+	if !ok || len(rows) == 0 {
+		r.log.Warn(fmt.Sprintf("Fuente de datos CSV %s no disponible o vacía", dataSourceName))
+		return data
+	}
+
+	headers := r.csvHeaders[dataSourceName]
+
+	// Seleccionar un registro basado en el número de hilo (circular)
+	rowIndex := threadNum % len(rows)
+	row := rows[rowIndex]
+
+	// Generar el mapa de variables
+	for i, header := range headers {
+		if i < len(row) {
+			data[header] = row[i]
+		}
+	}
+
+	return data
 }
 
 // Run ejecuta la prueba de stress
@@ -236,6 +431,14 @@ mainLoop:
 			if elapsedSeconds > 0 {
 				requestDelta := r.testResult.TotalRequests - lastRequestCount
 				requestsPerSecond = float64(requestDelta) / elapsedSeconds
+
+				// Ajustar la tasa si parece anormalmente baja comparada con el número de hilos activos
+				// Si hay muchos hilos activos pero pocas solicitudes, podría haber un problema de medición
+				if activeThreads > 10 && requestsPerSecond < float64(activeThreads)/2 {
+					r.log.Debug(fmt.Sprintf("Posible subestimación de solicitudes/s: %d hilos activos pero solo %.2f solicitudes/s",
+						activeThreads, requestsPerSecond))
+				}
+
 				lastRequestCount = r.testResult.TotalRequests
 				lastSampleTime = now
 			}
@@ -263,8 +466,10 @@ mainLoop:
 
 			r.statsMutex.Unlock()
 
-			// Mostrar información en el log
-			r.log.Info(fmt.Sprintf("Hilos activos: %d, Solicitudes/s: %.2f", activeThreads, requestsPerSecond))
+			// Mostrar información detallada en el log
+			r.log.Info(fmt.Sprintf("Hilos activos: %d/%d (%.1f%%), Solicitudes/s: %.2f, Total solicitudes: %d",
+				activeThreads, maxThreads, float64(activeThreads)/float64(maxThreads)*100,
+				requestsPerSecond, r.testResult.TotalRequests))
 
 		case <-ticker.C:
 			now := time.Now()
@@ -432,34 +637,31 @@ func (r *Runner) executeThread(ctx context.Context, threadNum int) {
 	// Clonar el mapa de variables para este hilo
 	threadVars := r.cloneVariables()
 
+	// Agregar un mapa para llevar registro de los servicios ejecutados en este hilo
+	executedServices := make(map[string]bool)
+
 	r.log.Debug(fmt.Sprintf("Hilo %d iniciado", threadNum))
 
-	// Ejecutar los servicios en ciclos para mantener el hilo activo más tiempo
-	// Definimos un número de ciclos que variará según el número del hilo
-	// Hilos con números menores tendrán más ciclos para quedarse activos más tiempo
-	// 10 ciclos para los primeros hilos, 2 para los últimos
-	maxCycles := 10
-	minCycles := 2
-	totalThreadsRange := 500.0 // Asumimos un rango máximo de 500 hilos
+	// En lugar de un número fijo de ciclos, ejecutamos hasta que el contexto sea cancelado
+	cycleCount := 0
 
-	cycles := maxCycles - int(float64(threadNum)/totalThreadsRange*float64(maxCycles-minCycles))
-	if cycles < minCycles {
-		cycles = minCycles
-	}
-
-	r.log.Debug(fmt.Sprintf("Hilo %d ejecutará %d ciclos", threadNum, cycles))
-
-	for cycle := 0; cycle < cycles; cycle++ {
+	for {
 		// Verificar si el contexto ya fue cancelado
 		select {
 		case <-ctx.Done():
-			r.log.Debug(fmt.Sprintf("Hilo %d cancelado (fin de prueba) en ciclo %d", threadNum, cycle))
+			r.log.Debug(fmt.Sprintf("Hilo %d cancelado (fin de prueba) después de %d ciclos", threadNum, cycleCount))
 			return
 		default:
 			// Continuar con la ejecución
 		}
 
-		r.log.Debug(fmt.Sprintf("Hilo %d: Iniciando ciclo %d/%d", threadNum, cycle+1, cycles))
+		cycleCount++
+		r.log.Debug(fmt.Sprintf("Hilo %d: Iniciando ciclo %d", threadNum, cycleCount))
+
+		// Reiniciar el mapa de servicios ejecutados al comienzo de cada ciclo
+		for k := range executedServices {
+			delete(executedServices, k)
+		}
 
 		// Ejecutar cada servicio en el orden definido
 		for i, service := range r.cfg.Services {
@@ -467,21 +669,42 @@ func (r *Runner) executeThread(ctx context.Context, threadNum int) {
 			select {
 			case <-ctx.Done():
 				r.log.Debug(fmt.Sprintf("Hilo %d cancelado (fin de prueba) en ciclo %d, servicio %s",
-					threadNum, cycle, service.Name))
+					threadNum, cycleCount, service.Name))
 				return
 			default:
 				// Continuar con la ejecución
 			}
 
 			// Loguear progreso de servicios
-			r.log.Debug(fmt.Sprintf("Hilo %d, Ciclo %d/%d: Ejecutando servicio %d/%d: %s",
-				threadNum, cycle+1, cycles, i+1, len(r.cfg.Services), service.Name))
+			r.log.Debug(fmt.Sprintf("Hilo %d, Ciclo %d: Ejecutando servicio %d/%d: %s",
+				threadNum, cycleCount, i+1, len(r.cfg.Services), service.Name))
 
-			// Si el servicio depende de otro, verificar que tengamos las variables necesarias
-			if service.DependsOn != "" && threadVars[service.DependsOn] == "" {
-				r.log.Debug(fmt.Sprintf("Hilo %d: Omitiendo servicio %s porque depende de %s que no está disponible",
-					threadNum, service.Name, service.DependsOn))
-				continue
+			// Si el servicio depende de otro, verificar que se haya ejecutado
+			if service.DependsOn != "" {
+				// Comprobar si el servicio del que depende ya fue ejecutado en este ciclo
+				if !executedServices[service.DependsOn] {
+					r.log.Debug(fmt.Sprintf("Hilo %d: Omitiendo servicio %s porque depende de %s que no ha sido ejecutado en este ciclo",
+						threadNum, service.Name, service.DependsOn))
+					continue
+				}
+
+				// Si también se requiere una variable específica, verificar que exista
+				if threadVars[service.DependsOn] == "" {
+					r.log.Debug(fmt.Sprintf("Hilo %d: El servicio %s requiere la variable %s que no está disponible a pesar de haberse ejecutado el servicio dependiente",
+						threadNum, service.Name, service.DependsOn))
+					// Continuamos de todas formas, ya que el servicio dependiente fue ejecutado
+				}
+			}
+
+			// Cargar datos de la fuente de datos para este servicio
+			if service.DataSourceName != "" {
+				csvData := r.getCSVDataForThread(service.DataSourceName, threadNum)
+				// Añadir los datos al mapa de variables del hilo
+				for k, v := range csvData {
+					threadVars[k] = v
+					r.log.Debug(fmt.Sprintf("Hilo %d: Cargando variable %s = %s desde CSV %s",
+						threadNum, k, v, service.DataSourceName))
+				}
 			}
 
 			// Ejecutar el servicio
@@ -500,6 +723,9 @@ func (r *Runner) executeThread(ctx context.Context, threadNum int) {
 				continue
 			}
 
+			// Marcar este servicio como ejecutado en este ciclo
+			executedServices[service.Name] = true
+
 			// Registrar el resultado exitoso
 			r.registerServiceResult(service.Name, result.statusCode, result.responseTime, "", threadNum)
 
@@ -512,26 +738,22 @@ func (r *Runner) executeThread(ctx context.Context, threadNum int) {
 			}
 
 			// Pausa breve entre servicios para simular pensamiento/procesamiento
-			// Varía según el número de hilo para evitar sincronización
-			pauseMs := 100 + (threadNum % 900)
+			// Variable según el número de hilo para evitar sincronización
+			pauseMs := 50 + (threadNum % 50) // Reducir la pausa para aumentar el rendimiento
 			time.Sleep(time.Duration(pauseMs) * time.Millisecond)
 		}
 
-		r.log.Debug(fmt.Sprintf("Hilo %d: Completado ciclo %d/%d", threadNum, cycle+1, cycles))
+		r.log.Debug(fmt.Sprintf("Hilo %d: Completado ciclo %d", threadNum, cycleCount))
 
-		// Pausa entre ciclos, variable según el número de hilo
-		if cycle < cycles-1 { // No esperar después del último ciclo
-			pauseMs := 200 + (threadNum % 800)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Duration(pauseMs) * time.Millisecond):
-				// Continuar después de la pausa
-			}
+		// Pausa breve entre ciclos
+		pauseMs := 100 + (threadNum % 400) // Reducir la pausa entre ciclos
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Duration(pauseMs) * time.Millisecond):
+			// Continuar después de la pausa
 		}
 	}
-
-	r.log.Debug(fmt.Sprintf("Hilo %d completado exitosamente después de %d ciclos", threadNum, cycles))
 }
 
 // Estructura para almacenar el resultado de la ejecución de un servicio
@@ -541,52 +763,31 @@ type serviceResult struct {
 	extractedVars map[string]string
 }
 
-// logResponse registra la respuesta HTTP en el archivo de log
-func (r *Runner) logResponse(threadNum int, service *config.Service, req *http.Request, resp *http.Response, responseBody []byte, responseTime time.Duration, extractedVars map[string]string) {
-	// Si no hay un logger de respuestas configurado, no hacer nada
-	if r.responseLog == nil {
-		return
-	}
-
-	// Crear un resumen de la respuesta para el log
-	logEntry := map[string]interface{}{
-		"timestamp":     time.Now().Format(time.RFC3339),
-		"thread_id":     threadNum,
-		"service":       service.Name,
-		"method":        req.Method,
-		"url":           req.URL.String(),
-		"status_code":   resp.StatusCode,
-		"response_time": responseTime.Milliseconds(),
-		"headers":       resp.Header,
-	}
-
-	// Limitar el tamaño del cuerpo para evitar logs demasiado grandes
-	maxBodySize := 4096 // 4KB máximo
-	responseBodyStr := string(responseBody)
-	if len(responseBodyStr) > maxBodySize {
-		responseBodyStr = responseBodyStr[:maxBodySize] + "... [truncado]"
-	}
-	logEntry["body"] = responseBodyStr
-
-	// Añadir variables extraídas si hay alguna
-	if len(extractedVars) > 0 {
-		logEntry["extracted_vars"] = extractedVars
-	}
-
-	// Registrar la respuesta en formato JSON
-	r.responseLog.WithFields(logEntry).Info(fmt.Sprintf("Respuesta HTTP para hilo %d, servicio %s: %d", threadNum, service.Name, resp.StatusCode))
-}
-
-// executeService ejecuta un servicio HTTP y devuelve el resultado
+// executeService ejecuta un servicio HTTP y devuelve la respuesta
 func (r *Runner) executeService(ctx context.Context, service *config.Service, vars map[string]string, threadNum int) (*serviceResult, error) {
-	// Verificar si el contexto ya fue cancelado antes de empezar
+	// Verificar si el contexto fue cancelado antes de empezar
 	if ctx.Err() != nil {
-		return nil, fmt.Errorf("petición cancelada (fin de prueba)")
+		return nil, ctx.Err()
 	}
 
-	// Loguear inicio de ejecución del servicio
+	// Registrar el inicio de la ejecución del servicio
 	r.log.Debug(fmt.Sprintf("Hilo %d: Iniciando ejecución del servicio %s", threadNum, service.Name))
 
+	// Aplicar limitación de tasa global si está configurada
+	if r.globalRateLimiter != nil {
+		r.log.Debug(fmt.Sprintf("Hilo %d: Esperando permiso del limitador global para ejecutar %s",
+			threadNum, service.Name))
+		r.globalRateLimiter.WaitUntilAllowed()
+	}
+
+	// Aplicar limitación de tasa específica del servicio si está configurada
+	if limiter, exists := r.serviceRateLimiters[service.Name]; exists {
+		r.log.Debug(fmt.Sprintf("Hilo %d: Esperando permiso del limitador específico para ejecutar %s",
+			threadNum, service.Name))
+		limiter.WaitUntilAllowed()
+	}
+
+	// Registrar el momento en que se inicia la solicitud
 	startTime := time.Now()
 
 	// Preparar la URL con las variables
@@ -625,7 +826,12 @@ func (r *Runner) executeService(ctx context.Context, service *config.Service, va
 	default:
 		// JSON u otro tipo de contenido (texto plano)
 		if service.Body != "" {
-			reqBody = strings.NewReader(r.replaceVariables(service.Body, vars))
+			// Aplicar templates al cuerpo JSON
+			processedBody := r.replaceVariables(service.Body, vars)
+			reqBody = strings.NewReader(processedBody)
+
+			// Guardar el cuerpo procesado para el log
+			service.ProcessedBody = processedBody
 		}
 	}
 
@@ -687,16 +893,40 @@ func (r *Runner) executeService(ctx context.Context, service *config.Service, va
 	// Extraer variables de la respuesta si es necesario
 	extractedVars := make(map[string]string)
 
-	// Por ahora solo extraemos el token si está configurado
-	if service.ExtractToken != "" && service.TokenName != "" {
+	bodyStr := string(responseBody)
+
+	// Extraer variables usando el nuevo mecanismo ExtractVars
+	if len(service.ExtractVars) > 0 {
+		for varName, regexPattern := range service.ExtractVars {
+			// Compilar la expresión regular
+			pattern, err := regexp.Compile(regexPattern)
+			if err != nil {
+				r.log.Warn(fmt.Sprintf("Hilo %d: Error al compilar regex '%s' para variable %s: %s",
+					threadNum, regexPattern, varName, err.Error()))
+				continue
+			}
+
+			// Intentar extraer el valor usando la regex
+			matches := pattern.FindStringSubmatch(bodyStr)
+
+			if len(matches) > 1 {
+				// El primer grupo capturado es el valor que queremos extraer
+				extractedVars[varName] = matches[1]
+				r.log.Debug(fmt.Sprintf("Hilo %d: Variable extraída %s = %s usando regex: %s",
+					threadNum, varName, matches[1], regexPattern))
+			} else {
+				r.log.Debug(fmt.Sprintf("Hilo %d: No se pudo extraer la variable %s usando regex: %s",
+					threadNum, varName, regexPattern))
+			}
+		}
+	}
+
+	// Por retrocompatibilidad, seguimos soportando ExtractToken/TokenName
+	if service.ExtractToken != "" && service.TokenName != "" && extractedVars[service.TokenName] == "" {
 		rule := service.ExtractToken
 		varName := service.TokenName
 
-		// En las pruebas, la regla es simplemente "token" y el cuerpo de respuesta es JSON:
-		// {"message": "Hello, World!", "token": "test_token"}
-		// Vamos a extraer el valor directamente del JSON
-		bodyStr := string(responseBody)
-		r.log.Debug(fmt.Sprintf("Hilo %d: Intentando extraer token. Respuesta: %s", threadNum, bodyStr))
+		r.log.Debug(fmt.Sprintf("Hilo %d: Intentando extraer token con método legacy", threadNum))
 
 		// Extraer value del JSON usando una regex simple
 		jsonPattern := fmt.Sprintf(`"%s"\s*:\s*"([^"]+)"`, rule)
@@ -719,11 +949,16 @@ func (r *Runner) executeService(ctx context.Context, service *config.Service, va
 				extractedVars[varName] = origMatches[1]
 				r.log.Debug(fmt.Sprintf("Hilo %d: Token extraído con regex original para %s: %s", threadNum, varName, origMatches[1]))
 			} else {
-				r.log.Debug(fmt.Sprintf("Hilo %d: No se pudo extraer el token usando ninguna técnica. Respuesta: %s, Regla: %s",
-					threadNum, bodyStr, rule))
+				r.log.Debug(fmt.Sprintf("Hilo %d: No se pudo extraer el token usando ninguna técnica",
+					threadNum))
 			}
 		}
 	}
+
+	// Añadir una variable especial con el nombre del servicio para indicar que se ejecutó correctamente
+	// Esto permite que otros servicios puedan depender de este sin necesidad de extraer variables específicas
+	extractedVars[service.Name] = "executed"
+	r.log.Debug(fmt.Sprintf("Hilo %d: Servicio %s marcado como ejecutado", threadNum, service.Name))
 
 	// Registrar la respuesta en el archivo de log si está configurado
 	r.logResponse(threadNum, service, req, resp, responseBody, responseTime, extractedVars)
@@ -733,6 +968,98 @@ func (r *Runner) executeService(ctx context.Context, service *config.Service, va
 		responseTime:  responseTime,
 		extractedVars: extractedVars,
 	}, nil
+}
+
+// logResponse registra la respuesta HTTP en el archivo de log
+func (r *Runner) logResponse(threadNum int, service *config.Service, req *http.Request, resp *http.Response, responseBody []byte, responseTime time.Duration, extractedVars map[string]string) {
+	// Si no hay un logger de respuestas configurado, no hacer nada
+	if r.responseLog == nil {
+		return
+	}
+
+	// Crear un resumen de la respuesta para el log
+	logEntry := map[string]interface{}{
+		"timestamp":     time.Now().Format(time.RFC3339),
+		"thread_id":     threadNum,
+		"service":       service.Name,
+		"method":        req.Method,
+		"url":           req.URL.String(),
+		"status_code":   resp.StatusCode,
+		"response_time": responseTime.Milliseconds(),
+	}
+
+	// Añadir los headers de la solicitud
+	requestHeaders := make(map[string]string)
+	for key, values := range req.Header {
+		if len(values) > 0 {
+			requestHeaders[key] = values[0]
+		}
+	}
+	logEntry["request_headers"] = requestHeaders
+
+	// Añadir el cuerpo de la solicitud si existe
+	if service.ProcessedBody != "" {
+		// Usar el cuerpo procesado que guardamos durante executeService
+		requestBodyStr := service.ProcessedBody
+
+		// Limitar el tamaño del cuerpo
+		maxReqBodySize := 4096 // 4KB máximo
+		if len(requestBodyStr) > maxReqBodySize {
+			requestBodyStr = requestBodyStr[:maxReqBodySize] + "... [truncado]"
+		}
+
+		logEntry["request_body"] = requestBodyStr
+	} else if req.Body != nil && req.ContentLength > 0 {
+		// Estamos en el caso de un formulario
+		var requestBodyStr string
+
+		switch strings.ToLower(service.ContentType) {
+		case "form", "form-urlencoded", "x-www-form-urlencoded":
+			// Reconstruir el formulario a partir de los datos del servicio
+			formValues := url.Values{}
+			for key, value := range service.FormData {
+				formValues.Add(key, value)
+			}
+			requestBodyStr = formValues.Encode()
+		default:
+			// Para JSON u otros tipos, usar el cuerpo configurado
+			requestBodyStr = service.Body
+		}
+
+		// Limitar el tamaño del cuerpo de la solicitud para el log
+		maxReqBodySize := 4096 // 4KB máximo
+		if len(requestBodyStr) > maxReqBodySize {
+			requestBodyStr = requestBodyStr[:maxReqBodySize] + "... [truncado]"
+		}
+
+		logEntry["request_body"] = requestBodyStr
+	}
+
+	// Añadir los headers de la respuesta
+	responseHeaders := make(map[string]string)
+	for key, values := range resp.Header {
+		if len(values) > 0 {
+			responseHeaders[key] = values[0]
+		}
+	}
+	logEntry["response_headers"] = responseHeaders
+
+	// Limitar el tamaño del cuerpo de la respuesta para evitar logs demasiado grandes
+	maxBodySize := 4096 // 4KB máximo
+	responseBodyStr := string(responseBody)
+	if len(responseBodyStr) > maxBodySize {
+		responseBodyStr = responseBodyStr[:maxBodySize] + "... [truncado]"
+	}
+	logEntry["response_body"] = responseBodyStr
+
+	// Añadir variables extraídas si hay alguna
+	if len(extractedVars) > 0 {
+		logEntry["extracted_vars"] = extractedVars
+	}
+
+	// Registrar la solicitud y respuesta en formato JSON
+	r.responseLog.WithFields(logEntry).Info(fmt.Sprintf("HTTP [%s] %s - Hilo %d - Servicio %s - Código %d - Tiempo %dms",
+		req.Method, req.URL.String(), threadNum, service.Name, resp.StatusCode, responseTime.Milliseconds()))
 }
 
 // registerServiceResult registra el resultado de un servicio para su inclusión en el reporte
@@ -818,16 +1145,76 @@ func (r *Runner) registerServiceResult(serviceName string, statusCode int, respo
 
 // replaceVariables reemplaza las variables en un string con sus valores correspondientes
 func (r *Runner) replaceVariables(input string, vars map[string]string) string {
+	if input == "" {
+		return input
+	}
+
+	// Primero, reemplazamos variables especiales como {{uuid}}
+	specialPattern := regexp.MustCompile(`\{\{uuid\}\}`)
+	input = specialPattern.ReplaceAllStringFunc(input, func(match string) string {
+		return generateUUID()
+	})
+
+	// Crear funciones personalizadas para el template
+	funcMap := template.FuncMap{
+		"uuid": generateUUID,
+	}
+
+	// Preparar el template
+	tmpl, err := template.New("template").Funcs(funcMap).Parse(input)
+	if err != nil {
+		// Si hay un error al analizar el template, intentar con el método anterior
+		r.log.Debug(fmt.Sprintf("Error al procesar template: %s - Usando método alternativo", err.Error()))
+		return r.legacyReplaceVariables(input, vars)
+	}
+
+	// Crear un buffer para almacenar el resultado
+	var buf bytes.Buffer
+
+	// Ejecutar el template con las variables
+	err = tmpl.Execute(&buf, vars)
+	if err != nil {
+		// Si hay un error al ejecutar el template, intentar con el método anterior
+		r.log.Debug(fmt.Sprintf("Error al ejecutar template: %s - Usando método alternativo", err.Error()))
+		return r.legacyReplaceVariables(input, vars)
+	}
+
+	return buf.String()
+}
+
+// legacyReplaceVariables es el método antiguo de reemplazo usando expresiones regulares
+// Se usa como fallback si el método de templates falla
+func (r *Runner) legacyReplaceVariables(input string, vars map[string]string) string {
 	result := input
 
-	// Patrón para detectar referencias a variables: {{variable}}
+	// Patrón para detectar referencias a variables: {{variable}} o {{.variable}}
 	pattern := regexp.MustCompile(`\{\{([^{}]+)\}\}`)
 
 	return pattern.ReplaceAllStringFunc(result, func(match string) string {
 		// Extraer el nombre de la variable (quitar {{ y }})
 		varName := strings.TrimSpace(match[2 : len(match)-2])
 
-		// Buscar el valor de la variable
+		// Caso especial: generar un UUID v4
+		if varName == "uuid" {
+			return generateUUID()
+		}
+
+		// Caso especial: variables de data_source con formato {{.variable}}
+		if strings.HasPrefix(varName, ".") {
+			dataSourceVar := strings.TrimPrefix(varName, ".")
+			// Buscar en el mapa de variables con el nombre sin el punto
+			if value, ok := vars[dataSourceVar]; ok {
+				return value
+			}
+			// Si no se encuentra, intentar con el nombre completo (incluyendo el punto)
+			if value, ok := vars[varName]; ok {
+				return value
+			}
+			r.log.Debug(fmt.Sprintf("Variable de data_source no encontrada: %s", dataSourceVar))
+			return match // Mantener la referencia original si no se encuentra
+		}
+
+		// Caso normal: buscar la variable en el mapa
 		if value, ok := vars[varName]; ok {
 			return value
 		}
@@ -835,6 +1222,34 @@ func (r *Runner) replaceVariables(input string, vars map[string]string) string {
 		// Si no se encuentra, devolver la referencia original
 		return match
 	})
+}
+
+// generateUUID genera un UUID v4 único
+func generateUUID() string {
+	// Implementar usando un algoritmo simple sin dependencias externas
+	// Este es un método básico para generar un ID único similar a un UUID v4
+	// Para entornos de producción, considerar usar github.com/google/uuid
+
+	// Formato UUID: 8-4-4-4-12 caracteres (hexadecimal)
+	const chars = "0123456789abcdef"
+	uuid := make([]byte, 36)
+
+	// Generar caracteres aleatorios
+	for i := 0; i < 36; i++ {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			uuid[i] = '-'
+		} else if i == 14 {
+			uuid[i] = '4' // Versión 4
+		} else if i == 19 {
+			uuid[i] = chars[8+(time.Now().Nanosecond()%4)] // 8, 9, a, o b
+		} else {
+			uuid[i] = chars[time.Now().Nanosecond()%16]
+			// Pequeña pausa para evitar repeticiones
+			time.Sleep(time.Nanosecond)
+		}
+	}
+
+	return string(uuid)
 }
 
 // cloneVariables crea una copia del mapa de variables compartidas

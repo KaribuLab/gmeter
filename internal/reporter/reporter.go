@@ -33,7 +33,7 @@ func NewSVGChartGenerator(width, height, margin int) *SVGChartGenerator {
 // GenerateTimeSeriesChart genera un gráfico de series temporales
 func (g *SVGChartGenerator) GenerateTimeSeriesChart(title string, data map[string][]float64, xLabels []string) (string, error) {
 	// Calcular las dimensiones del gráfico
-	chartWidth := g.Width - 2*g.Margin
+	chartWidth := g.Width - 2*g.Margin - 150 // Reservar espacio para las leyendas a la derecha
 	chartHeight := g.Height - 2*g.Margin
 
 	// Encontrar los valores mínimos y máximos
@@ -60,22 +60,34 @@ func (g *SVGChartGenerator) GenerateTimeSeriesChart(title string, data map[strin
 
 	// Escribir el título
 	buf.WriteString(fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="16" text-anchor="middle">%s</text>`,
-		g.Width/2, g.Margin/2, title))
+		(g.Width-150)/2, g.Margin/2, title))
 
 	// Dibujar el eje X
 	buf.WriteString(fmt.Sprintf(`<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="black" stroke-width="1" />`,
-		g.Margin, g.Height-g.Margin, g.Width-g.Margin, g.Height-g.Margin))
+		g.Margin, g.Height-g.Margin, g.Margin+chartWidth, g.Height-g.Margin))
 
 	// Dibujar el eje Y
 	buf.WriteString(fmt.Sprintf(`<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="black" stroke-width="1" />`,
 		g.Margin, g.Margin, g.Margin, g.Height-g.Margin))
 
-	// Dibujar las etiquetas del eje X
+	// Dibujar las etiquetas del eje X (reducidas para evitar solapamiento)
 	xStep := chartWidth / len(xLabels)
+	maxLabels := chartWidth / 80 // Aproximadamente un label cada 80px para evitar solapamiento
+	if maxLabels < 2 {
+		maxLabels = 2
+	}
+
+	labelInterval := len(xLabels) / int(maxLabels)
+	if labelInterval < 1 {
+		labelInterval = 1
+	}
+
 	for i, label := range xLabels {
-		x := g.Margin + i*xStep
-		buf.WriteString(fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="10" text-anchor="middle">%s</text>`,
-			x, g.Height-g.Margin/2, label))
+		if i%labelInterval == 0 || i == len(xLabels)-1 { // Mostrar primero, último y cada intervalo
+			x := g.Margin + i*xStep
+			buf.WriteString(fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="10" text-anchor="middle">%s</text>`,
+				x, g.Height-g.Margin/2, label))
+		}
 	}
 
 	// Dibujar las etiquetas del eje Y
@@ -90,6 +102,14 @@ func (g *SVGChartGenerator) GenerateTimeSeriesChart(title string, data map[strin
 	// Dibujar las líneas para cada serie
 	colors := []string{"#ff0000", "#00ff00", "#0000ff", "#ff00ff", "#00ffff", "#ffff00"}
 
+	// Dibujar leyendas en el lado derecho
+	legendX := g.Margin + chartWidth + 20
+	legendTitleY := g.Margin + 20
+
+	// Título de la leyenda
+	buf.WriteString(fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="12" font-weight="bold">Leyenda:</text>`,
+		legendX, legendTitleY))
+
 	i := 0
 	for name, values := range data {
 		// Dibujar la línea
@@ -103,9 +123,8 @@ func (g *SVGChartGenerator) GenerateTimeSeriesChart(title string, data map[strin
 
 		buf.WriteString(fmt.Sprintf(`" fill="none" stroke="%s" stroke-width="2" />`, colors[i%len(colors)]))
 
-		// Dibujar la leyenda
-		legendX := g.Margin + 20
-		legendY := g.Margin + 20 + i*20
+		// Dibujar la leyenda en el lado derecho
+		legendY := legendTitleY + 25 + i*20
 		buf.WriteString(fmt.Sprintf(`<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="%s" stroke-width="2" />`,
 			legendX, legendY, legendX+30, legendY, colors[i%len(colors)]))
 		buf.WriteString(fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="12">%s</text>`,
@@ -162,6 +181,10 @@ func generateThreadActivityChart(result *models.TestResult, g *SVGChartGenerator
 
 // GenerateReport genera un reporte de las pruebas
 func GenerateReport(result *models.TestResult, reportDir string) (string, error) {
+	// Calcular estadísticas adicionales
+	result.CalculateAdditionalStats()
+	effectiveRPS := result.GetEffectiveRequestsPerSecond()
+
 	// Crear el directorio de reportes si no existe
 	if err := os.MkdirAll(reportDir, 0755); err != nil {
 		return "", fmt.Errorf("error al crear el directorio de reportes: %w", err)
@@ -210,10 +233,40 @@ func GenerateReport(result *models.TestResult, reportDir string) (string, error)
 	fmt.Fprintf(file, "- **Duración:** %s\n", result.EndTime.Sub(result.StartTime))
 	fmt.Fprintf(file, "- **Total de solicitudes:** %d\n", result.TotalRequests)
 	fmt.Fprintf(file, "- **Máximo de hilos activos:** %d\n", result.MaxActiveThreads)
+	fmt.Fprintf(file, "- **Promedio de hilos activos:** %.2f\n", result.AvgActiveThreads)
+	fmt.Fprintf(file, "- **Solicitudes por segundo (efectivo):** %.2f\n", effectiveRPS)
 
 	if result.TotalRequests > 0 {
 		fmt.Fprintf(file, "- **Solicitudes exitosas:** %d (%.2f%%)\n", result.SuccessRequests, float64(result.SuccessRequests)/float64(result.TotalRequests)*100)
 		fmt.Fprintf(file, "- **Solicitudes fallidas:** %d (%.2f%%)\n", result.FailedRequests, float64(result.FailedRequests)/float64(result.TotalRequests)*100)
+	}
+
+	// Añadir métricas de concurrencia
+	if len(result.ThreadActivity) > 0 {
+		// Calcular las tasas de solicitudes máximas y promedio
+		var maxRPS, totalRPS float64
+		var validRPSSamples int
+
+		for _, activity := range result.ThreadActivity {
+			if activity.RequestsPS > maxRPS {
+				maxRPS = activity.RequestsPS
+			}
+
+			if activity.RequestsPS > 0 {
+				totalRPS += activity.RequestsPS
+				validRPSSamples++
+			}
+		}
+
+		avgRPS := 0.0
+		if validRPSSamples > 0 {
+			avgRPS = totalRPS / float64(validRPSSamples)
+		}
+
+		fmt.Fprintf(file, "\n### Métricas de Concurrencia\n\n")
+		fmt.Fprintf(file, "- **Pico de solicitudes por segundo:** %.2f\n", maxRPS)
+		fmt.Fprintf(file, "- **Promedio de solicitudes por segundo:** %.2f\n", avgRPS)
+		fmt.Fprintf(file, "- **Relación solicitudes/hilos activos:** %.2f\n", avgRPS/math.Max(1, result.AvgActiveThreads))
 	}
 
 	// Mostrar resumen de códigos de estado HTTP
@@ -504,14 +557,22 @@ func generateTimeSeriesCharts(result *models.TestResult, chartGenerator *SVGChar
 		timeLabels = append(timeLabels, t.Format("15:04:05"))
 	}
 
+	// Obtener el valor efectivo de RPS para todos los servicios
+	effectiveRPS := result.GetEffectiveRequestsPerSecond()
+
 	// Generar datos para el gráfico de solicitudes por segundo
 	for _, name := range serviceNames {
 		stats := result.ServiceStats[name]
 
 		var values []float64
 		for i := 0; i < numPoints; i++ {
-			// Usar los datos reales de solicitudes por segundo
-			value := stats.RequestsPerSecond * (0.5 + 0.5*float64(i)/float64(numPoints))
+			// Usar el valor real de solicitudes por segundo para cada servicio
+			// Si hay múltiples servicios, distribuir el RPS efectivo en proporción a las solicitudes de cada servicio
+			serviceRatio := 1.0
+			if result.TotalRequests > 0 {
+				serviceRatio = float64(stats.TotalRequests) / float64(result.TotalRequests)
+			}
+			value := effectiveRPS * serviceRatio
 			values = append(values, value)
 		}
 
@@ -531,8 +592,8 @@ func generateTimeSeriesCharts(result *models.TestResult, chartGenerator *SVGChar
 
 		var values []float64
 		for i := 0; i < numPoints; i++ {
-			// Usar los datos reales de tiempos de respuesta
-			value := stats.AvgResponseTime.Seconds() * (0.8 + 0.4*float64(i)/float64(numPoints))
+			// Usar el valor real del tiempo promedio de respuesta para cada servicio
+			value := stats.AvgResponseTime.Seconds()
 			values = append(values, value)
 		}
 
@@ -582,15 +643,22 @@ func GenerateCharts(result *models.TestResult, reportDir string) error {
 		timeLabels = append(timeLabels, t.Format("15:04:05"))
 	}
 
-	// Generar datos aleatorios para el ejemplo
-	// En una implementación real, estos datos vendrían de las métricas reales
+	// Obtener el valor efectivo de RPS para todos los servicios
+	effectiveRPS := result.GetEffectiveRequestsPerSecond()
+
+	// Generar datos para el gráfico
 	for _, name := range serviceNames {
 		stats := result.ServiceStats[name]
 
 		var values []float64
 		for i := 0; i < numPoints; i++ {
-			// Simular una curva de solicitudes por segundo
-			value := stats.RequestsPerSecond * (0.5 + 0.5*float64(i)/float64(numPoints))
+			// Usar el valor real de solicitudes por segundo para cada servicio
+			// Si hay múltiples servicios, distribuir el RPS efectivo en proporción a las solicitudes de cada servicio
+			serviceRatio := 1.0
+			if result.TotalRequests > 0 {
+				serviceRatio = float64(stats.TotalRequests) / float64(result.TotalRequests)
+			}
+			value := effectiveRPS * serviceRatio
 			values = append(values, value)
 		}
 
@@ -612,14 +680,14 @@ func GenerateCharts(result *models.TestResult, reportDir string) error {
 	// Generar un gráfico de tiempos de respuesta
 	responseTimes := make(map[string][]float64)
 
-	// Generar datos aleatorios para el ejemplo
+	// Generar datos para el gráfico
 	for _, name := range serviceNames {
 		stats := result.ServiceStats[name]
 
 		var values []float64
 		for i := 0; i < numPoints; i++ {
-			// Simular una curva de tiempos de respuesta
-			value := stats.AvgResponseTime.Seconds() * (0.8 + 0.4*float64(i)/float64(numPoints))
+			// Usar el valor real del tiempo promedio de respuesta para cada servicio
+			value := stats.AvgResponseTime.Seconds()
 			values = append(values, value)
 		}
 
@@ -860,7 +928,7 @@ func (g *SVGChartGenerator) GeneratePieChart(title string, data map[string]float
 			legendX, legendY-12, colors[i%len(colors)]))
 
 		// Dibujar texto para la leyenda
-		buf.WriteString(fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="12">%s (%.1f%%)</text>`,
+		buf.WriteString(fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="12">%s (%.2f%%)</text>`,
 			legendX+20, legendY, k, v/total*100))
 
 		startAngle = endAngle

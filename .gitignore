@@ -32,3 +32,4 @@ gmeter.yaml
 .DS_Store
 Thumbs.db 
 *.gz
+mock_server
