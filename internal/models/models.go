@@ -62,13 +62,23 @@ type ServiceStats struct {
 
 // TestResult representa el resultado de una prueba completa
 type TestResult struct {
-	StartTime       time.Time
-	EndTime         time.Time
-	TotalRequests   int
-	SuccessRequests int
-	FailedRequests  int
-	ServiceStats    map[string]*ServiceStats
-	Config          interface{}
+	StartTime         time.Time
+	EndTime           time.Time
+	TotalRequests     int
+	SuccessRequests   int
+	FailedRequests    int
+	ServiceStats      map[string]*ServiceStats
+	Config            interface{}
+	MaxActiveThreads  int                  // Número máximo de hilos activos alcanzado
+	ThreadActivity    []ThreadActivityData // Registro de actividad de hilos a lo largo del tiempo
+	StatusCodeSummary map[int]int          // Resumen de códigos de estado HTTP
+}
+
+// ThreadActivityData registra información sobre los hilos activos en un momento dado
+type ThreadActivityData struct {
+	Timestamp     time.Time // Momento de la medición
+	ActiveThreads int       // Número de hilos activos en ese momento
+	RequestsPS    float64   // Solicitudes por segundo en ese momento
 }
 
 // DataRecord representa un registro de datos para las pruebas

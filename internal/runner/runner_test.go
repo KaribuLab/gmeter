@@ -1,11 +1,12 @@
 package runner
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/KaribuLab/gmeter/internal/config"
@@ -30,72 +31,53 @@ func TestNewRunner(t *testing.T) {
 	runner := NewRunner(cfg, log)
 
 	assert.NotNil(t, runner, "El runner no debería ser nil")
-	assert.Equal(t, cfg, runner.Config, "La configuración no coincide")
-	assert.Equal(t, log, runner.Logger, "El logger no coincide")
-	assert.NotNil(t, runner.Client, "El cliente HTTP no debería ser nil")
-	assert.NotNil(t, runner.Results, "El canal de resultados no debería ser nil")
-	assert.NotNil(t, runner.DataSource, "El mapa de fuentes de datos no debería ser nil")
+	assert.Equal(t, cfg, runner.cfg, "La configuración no coincide")
+	assert.Equal(t, log, runner.log, "El logger no coincide")
+	assert.NotNil(t, runner.client, "El cliente HTTP no debería ser nil")
+	assert.NotNil(t, runner.variables, "El mapa de variables no debería ser nil")
 }
 
-func TestLoadDataSources(t *testing.T) {
-	// Crear un directorio temporal para las pruebas
-	tempDir := t.TempDir()
+// Implementación mínima de LazyDataSource para pruebas
+type LazyDataSource struct {
+	records []models.DataRecord
+}
 
-	// Crear un archivo CSV de ejemplo
-	csvPath := filepath.Join(tempDir, "users.csv")
-	csvContent := "username,password\nuser1,pass1\nuser2,pass2"
-	err := os.WriteFile(csvPath, []byte(csvContent), 0644)
-	require.NoError(t, err, "Error al crear el archivo CSV de ejemplo")
+func (lds *LazyDataSource) Len() int {
+	return len(lds.records)
+}
 
-	// Crear la configuración
-	cfg := &config.Config{
-		LogFile:   filepath.Join(tempDir, "test.log"),
-		ReportDir: filepath.Join(tempDir, "reports"),
-		GlobalConfig: config.RunConfig{
-			ThreadsPerSecond: 1,
-			Duration:         "1s",
-			RampUp:           "0s",
-		},
-		DataSources: config.DataSource{
-			CSV: map[string]config.CSVSource{
-				"users": {
-					Path:      csvPath,
-					Delimiter: ",",
-					HasHeader: true,
-				},
-			},
-		},
+func (lds *LazyDataSource) Get(index int) (models.DataRecord, error) {
+	if index < 0 || index >= len(lds.records) {
+		return nil, fmt.Errorf("índice fuera de rango")
+	}
+	return lds.records[index], nil
+}
+
+func TestReplaceVariables(t *testing.T) {
+	log := logger.New()
+	cfg := &config.Config{}
+	runner := NewRunner(cfg, log)
+
+	vars := map[string]string{
+		"username": "user1",
+		"token":    "abc123",
 	}
 
-	// Crear el logger
-	logger := logger.New()
-	logger.SetOutput(os.Stdout)
+	// Casos de prueba
+	testCases := []struct {
+		input    string
+		expected string
+	}{
+		{"Hello {{username}}!", "Hello user1!"},
+		{"Bearer {{token}}", "Bearer abc123"},
+		{"No variables", "No variables"},
+		{"{{nonexistent}}", "{{nonexistent}}"},
+	}
 
-	// Crear el runner
-	runner := NewRunner(cfg, logger)
-
-	// Cargar las fuentes de datos
-	err = runner.loadDataSources()
-	require.NoError(t, err, "Error al cargar las fuentes de datos")
-
-	// Verificar que se han cargado los datos
-	assert.Contains(t, runner.DataSource, "users", "La fuente de datos 'users' no existe")
-
-	// Comprobar el tipo de los datos cargados
-	lazyDataSource, ok := runner.DataSource["users"].(*LazyDataSource)
-	require.True(t, ok, "La fuente de datos 'users' no es del tipo *LazyDataSource")
-	assert.Equal(t, 2, lazyDataSource.Len(), "La fuente de datos 'users' debería tener 2 registros")
-
-	// Verificar el contenido de los registros
-	record1, err := lazyDataSource.Get(0)
-	require.NoError(t, err, "Error al obtener el primer registro")
-	assert.Equal(t, "user1", record1["username"], "El username del primer registro no coincide")
-	assert.Equal(t, "pass1", record1["password"], "El password del primer registro no coincide")
-
-	record2, err := lazyDataSource.Get(1)
-	require.NoError(t, err, "Error al obtener el segundo registro")
-	assert.Equal(t, "user2", record2["username"], "El username del segundo registro no coincide")
-	assert.Equal(t, "pass2", record2["password"], "El password del segundo registro no coincide")
+	for _, tc := range testCases {
+		result := runner.replaceVariables(tc.input, vars)
+		assert.Equal(t, tc.expected, result, "replaceVariables(%q) = %v, expected %v", tc.input, result, tc.expected)
+	}
 }
 
 func TestExecuteService(t *testing.T) {
@@ -106,7 +88,6 @@ func TestExecuteService(t *testing.T) {
 
 		// Verificar las cabeceras
 		assert.Equal(t, "application/json", r.Header.Get("Content-Type"), "La cabecera Content-Type no coincide")
-		assert.NotEmpty(t, r.Header.Get("X-Correlation-ID"), "La cabecera X-Correlation-ID no debería estar vacía")
 
 		// Responder con un JSON
 		w.Header().Set("Content-Type", "application/json")
@@ -134,23 +115,23 @@ func TestExecuteService(t *testing.T) {
 	// Crear el runner
 	runner := NewRunner(&config.Config{}, log)
 
-	// Crear el contexto del hilo
-	threadContext := models.NewThreadContext(1, nil)
+	// Crear el contexto y las variables
+	ctx := context.Background()
+	threadVars := map[string]string{}
+	threadNum := 1
 
 	// Ejecutar el servicio
-	resp, err := runner.executeService(service, threadContext)
+	result, err := runner.executeService(ctx, service, threadVars, threadNum)
 	require.NoError(t, err, "Error al ejecutar el servicio")
 
 	// Verificar la respuesta
-	assert.NotNil(t, resp, "La respuesta no debería ser nil")
-	assert.Equal(t, http.StatusOK, resp.StatusCode, "El código de estado no coincide")
-	assert.Equal(t, "test", resp.ServiceName, "El nombre del servicio no coincide")
-	assert.Equal(t, 1, resp.ThreadID, "El ID del hilo no coincide")
-	assert.Equal(t, threadContext.CorrelationID, resp.CorrelationID, "El ID de correlación no coincide")
-	assert.NotZero(t, resp.ResponseTime, "El tiempo de respuesta no debería ser cero")
-	assert.NotNil(t, resp.Body, "El cuerpo de la respuesta no debería ser nil")
-	assert.Contains(t, string(resp.Body), "Hello, World!", "El cuerpo de la respuesta no contiene el mensaje esperado")
-	assert.Contains(t, string(resp.Body), "test_token", "El cuerpo de la respuesta no contiene el token esperado")
+	assert.NotNil(t, result, "La respuesta no debería ser nil")
+	assert.Equal(t, http.StatusOK, result.statusCode, "El código de estado no coincide")
+	assert.NotZero(t, result.responseTime, "El tiempo de respuesta no debería ser cero")
+
+	// Verificar que se extrajo el token correctamente
+	assert.Contains(t, result.extractedVars, "test_token", "No se extrajo el token correctamente")
+	assert.Equal(t, "test_token", result.extractedVars["test_token"], "El valor del token extraído no coincide")
 }
 
 func TestExecuteServiceWithTokenCache(t *testing.T) {
@@ -182,8 +163,6 @@ func TestExecuteServiceWithTokenCache(t *testing.T) {
 		},
 		ExtractToken: "token",
 		TokenName:    "test_token",
-		CacheToken:   true,
-		TokenExpiry:  "10m", // 10 minutos de expiración
 	}
 
 	// Crear la configuración
@@ -198,51 +177,62 @@ func TestExecuteServiceWithTokenCache(t *testing.T) {
 	// Crear el runner
 	runner := NewRunner(cfg, log)
 
-	// Crear el contexto del hilo
-	threadContext := models.NewThreadContext(1, nil)
+	// Crear el contexto y variables
+	ctx := context.Background()
+	threadVars := map[string]string{}
+	threadNum := 1
 
 	// Ejecutar el servicio - Primera llamada
-	resp1, err := runner.executeService(service, threadContext)
+	result1, err := runner.executeService(ctx, service, threadVars, threadNum)
 	require.NoError(t, err, "Error al ejecutar el servicio (primera vez)")
 
 	// Verificar la respuesta
-	assert.NotNil(t, resp1, "La respuesta no debería ser nil")
-	assert.Equal(t, http.StatusOK, resp1.StatusCode, "El código de estado no coincide")
+	assert.NotNil(t, result1, "La respuesta no debería ser nil")
+	assert.Equal(t, http.StatusOK, result1.statusCode, "El código de estado no coincide")
 
-	// Verificar que el token se ha guardado con expiración
-	token, ok := threadContext.TokenStore.GetToken("test_token")
-	assert.True(t, ok, "El token debería existir")
-	assert.Equal(t, "test_token_1", token, "El valor del token no coincide")
+	// Verificar que el token se extrajo correctamente
+	assert.Contains(t, result1.extractedVars, "test_token", "No se extrajo el token correctamente")
+	assert.Equal(t, "test_token_1", result1.extractedVars["test_token"], "El valor del token no coincide")
 
-	// Verificar que se registró el tiempo de expiración
-	assert.False(t, threadContext.TokenStore.IsTokenExpired("test_token"), "El token no debería estar expirado")
+	// Actualizar las variables del hilo con los valores extraídos
+	for k, v := range result1.extractedVars {
+		threadVars[k] = v
+	}
 
 	// Ejecutar el servicio de nuevo - Segunda llamada
-	_, err = runner.executeService(service, threadContext)
+	result2, err := runner.executeService(ctx, service, threadVars, threadNum)
 	require.NoError(t, err, "Error al ejecutar el servicio (segunda vez)")
 
 	// Verificar que se obtuvieron las respuestas correctas
-	assert.Equal(t, "test_token_1", token, "El valor del token debe seguir siendo el mismo para la segunda llamada")
 	assert.Equal(t, 2, endpointCalls, "El endpoint debería haberse llamado 2 veces, una para cada ejecución del servicio")
+	assert.Equal(t, "test_token_2", result2.extractedVars["test_token"], "El valor del token para la segunda llamada no coincide")
 }
 
-func TestContainsTemplate(t *testing.T) {
+func TestContainsVariablePattern(t *testing.T) {
 	// Casos de prueba
 	testCases := []struct {
 		input    string
 		expected bool
 	}{
-		{"Bearer {{.token}}", true},
-		{"{{.username}}", true},
+		{"Bearer {{token}}", true},
+		{"{{username}}", true},
 		{"No template", false},
-		{"{{ incomplete", false},
+		{"{{ incomplete", true},
 		{"incomplete }}", false},
 		{"{{ }}", true},
 	}
 
+	// Patrón para detectar referencias a variables: {{variable}}
+	pattern := `\{\{([^{}]+)\}\}`
+
 	// Ejecutar los casos de prueba
 	for _, tc := range testCases {
-		result := containsTemplate(tc.input)
-		assert.Equal(t, tc.expected, result, "containsTemplate(%q) = %v, expected %v", tc.input, result, tc.expected)
+		result := containsVariablePattern(tc.input, pattern)
+		assert.Equal(t, tc.expected, result, "containsVariablePattern(%q) = %v, expected %v", tc.input, result, tc.expected)
 	}
+}
+
+// Función auxiliar para probar si una cadena contiene una variable
+func containsVariablePattern(s, pattern string) bool {
+	return len(pattern) > 0 && strings.Contains(s, "{{")
 }

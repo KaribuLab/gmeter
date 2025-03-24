@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -65,7 +66,10 @@ Permite configurar múltiples servicios, hilos por segundo, y generar reportes d
 			// Iniciar el runner con la configuración cargada
 			log.Info("Iniciando pruebas de stress...")
 			r := runner.NewRunner(cfg, log)
-			return r.Run()
+
+			// Crear un contexto para la ejecución
+			ctx := context.Background()
+			return r.Run(ctx)
 		},
 	}
 

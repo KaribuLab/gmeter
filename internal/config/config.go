@@ -30,6 +30,7 @@ type RunConfig struct {
 	ThreadsPerSecond int    `mapstructure:"threads_per_second"` // Para compatibilidad con versiones anteriores
 	MinThreads       int    `mapstructure:"min_threads"`        // Número mínimo de hilos al iniciar
 	MaxThreads       int    `mapstructure:"max_threads"`        // Número máximo de hilos a alcanzar
+	BatchSize        int    `mapstructure:"batch_size"`         // Tamaño de los lotes de hilos durante el ramp-up
 	Duration         string `mapstructure:"duration"`
 	RampUp           string `mapstructure:"ramp_up"`
 }
@@ -82,6 +83,7 @@ func LoadConfig(cfgFile string) (*Config, error) {
 	v.SetDefault("global.threads_per_second", 10)
 	v.SetDefault("global.duration", "1m")
 	v.SetDefault("global.ramp_up", "10s")
+	v.SetDefault("global.batch_size", 50) // Valor por defecto para el tamaño de lotes
 
 	// Buscar el archivo de configuración
 	if cfgFile != "" {

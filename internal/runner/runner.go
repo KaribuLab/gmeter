@@ -1,1752 +1,850 @@
 package runner
 
 import (
-	"bytes"
-	"encoding/csv"
-	"encoding/json"
+	"context"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
-	"os"
-	"sort"
+	"net/url"
+	"regexp"
 	"strings"
 	"sync"
-	"text/template"
+	"sync/atomic"
 	"time"
-
-	"bufio"
 
 	"github.com/KaribuLab/gmeter/internal/config"
 	"github.com/KaribuLab/gmeter/internal/logger"
 	"github.com/KaribuLab/gmeter/internal/models"
 	"github.com/KaribuLab/gmeter/internal/reporter"
-	"github.com/google/uuid"
-	"github.com/tidwall/gjson"
 )
 
-// Runner es el ejecutor principal de las pruebas
 type Runner struct {
-	Config         *config.Config
-	Logger         *logger.Logger
-	ResponseWriter io.Writer
-	bufferedWriter *bufio.Writer
-	responseLogCh  chan string   // Canal para escritura asíncrona de logs
-	stopLogCh      chan struct{} // Canal para detener la goroutine de escritura
-	Client         *http.Client
-	Results        chan *models.Response
-	DataSource     map[string]interface{}
-	WaitGroup      sync.WaitGroup
-	StartTime      time.Time
-	EndTime        time.Time
-	StopChan       chan struct{}            // Canal para señalizar la terminación
-	GlobalTokens   *models.GlobalTokenStore // Almacén global de tokens
+	cfg           *config.Config
+	log           *logger.Logger
+	responseLog   *logger.Logger // Logger específico para las respuestas HTTP
+	client        *http.Client
+	variables     map[string]string // Para almacenar variables extraídas entre solicitudes
+	mutex         sync.RWMutex      // Para acceso seguro a variables compartidas
+	activeThreads int32             // Contador atómico para el número de hilos activos
+
+	// Para almacenar resultados y generar reportes
+	testResult *models.TestResult
+	statsMutex sync.Mutex // Para acceso seguro a las estadísticas
 }
 
-// NewRunner crea un nuevo runner
 func NewRunner(cfg *config.Config, log *logger.Logger) *Runner {
-	// Crear el cliente HTTP con timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second, // Timeout por defecto
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
+	runner := &Runner{
+		cfg:       cfg,
+		log:       log,
+		client:    &http.Client{Timeout: 30 * time.Second},
+		variables: make(map[string]string),
+		testResult: &models.TestResult{
+			StartTime:    time.Now(),
+			ServiceStats: make(map[string]*models.ServiceStats),
+			Config:       cfg,
 		},
 	}
 
-	// Si se especificó un timeout en la configuración global, usarlo
-	if cfg.GlobalConfig.Duration != "" {
-		if timeout, err := time.ParseDuration(cfg.GlobalConfig.Duration); err == nil {
-			client.Timeout = timeout * 2 // El timeout del cliente HTTP es el doble de la duración de la prueba
-		}
-	}
-
-	// Si se especificó un timeout específico para los servicios, usarlo
-	if cfg.GlobalConfig.Duration != "" {
-		if timeout, err := time.ParseDuration(cfg.GlobalConfig.Duration); err == nil {
-			client.Timeout = timeout * 2 // El timeout del cliente HTTP es el doble de la duración de la prueba
-		}
-	}
-
-	// Abrir el archivo de log de respuestas si está configurado
-	var responseWriter io.Writer
-	var bufferedWriter *bufio.Writer
+	// Inicializar el logger de respuestas si se ha configurado un archivo
 	if cfg.ResponseLogFile != "" {
-		// Crear o truncar el archivo
-		file, err := os.OpenFile(cfg.ResponseLogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-		if err != nil {
-			log.WithError(err).Error("Error al abrir el archivo de log de respuestas")
-		} else {
-			// Configurar un buffer de escritura para mejorar el rendimiento
-			bufferedWriter = bufio.NewWriterSize(file, 1024*1024) // 1MB buffer
-			responseWriter = bufferedWriter
-		}
+		responseLog := logger.New()
+		responseLog.SetLogFile(cfg.ResponseLogFile, false) // Solo salida a archivo, sin consola
+		runner.responseLog = responseLog
+		log.Info(fmt.Sprintf("Registrando respuestas HTTP en: %s", cfg.ResponseLogFile))
 	}
 
-	// Obtener la instancia del almacén global de tokens
-	globalTokens := models.GetGlobalTokenStore()
-
-	return &Runner{
-		Config:         cfg,
-		Logger:         log,
-		ResponseWriter: responseWriter,
-		bufferedWriter: bufferedWriter,
-		responseLogCh:  make(chan string, 1000), // Buffer grande para evitar bloqueos
-		stopLogCh:      make(chan struct{}),
-		Client:         client,
-		Results:        make(chan *models.Response, 1000), // Buffer grande para evitar bloqueos
-		DataSource:     make(map[string]interface{}),
-		WaitGroup:      sync.WaitGroup{},
-		StopChan:       make(chan struct{}),
-		GlobalTokens:   globalTokens,
-	}
+	return runner
 }
 
-// processResponseLogs procesa asíncronamente los logs de respuestas
-func (r *Runner) processResponseLogs() {
-	r.Logger.Info("Iniciando procesador asíncrono de logs de respuestas")
+// Run ejecuta la prueba de stress
+func (r *Runner) Run(ctx context.Context) error {
+	// Registrar hora de inicio
+	r.testResult.StartTime = time.Now()
 
+	// Inicializar el mapa de resumen de códigos de estado
+	r.testResult.StatusCodeSummary = make(map[int]int)
+
+	// Inicializar la lista de datos de actividad de hilos
+	r.testResult.ThreadActivity = make([]models.ThreadActivityData, 0)
+
+	// Crear un contexto cancelable
+	ctx, cancel := context.WithCancel(ctx)
+
+	// Parámetros de ejecución
+	var minThreads, maxThreads int
+	var duration, rampUp time.Duration
+	var err error
+
+	// Obtener la configuración de ejecución
+	cfg := r.cfg.GlobalConfig
+
+	// Determinar el número de hilos
+	minThreads = cfg.MinThreads
+	if minThreads <= 0 {
+		minThreads = 1 // Al menos 1 hilo
+	}
+
+	maxThreads = cfg.MaxThreads
+	if maxThreads <= 0 {
+		// Si no se especifica maxThreads, usar threadsPerSecond para compatibilidad
+		if cfg.ThreadsPerSecond > 0 {
+			maxThreads = cfg.ThreadsPerSecond
+		} else {
+			maxThreads = minThreads // Si no se especifica ninguno, usar minThreads
+		}
+	}
+
+	// Duración de la prueba
+	if cfg.Duration != "" {
+		duration, err = time.ParseDuration(cfg.Duration)
+		if err != nil {
+			return fmt.Errorf("error al analizar la duración: %w", err)
+		}
+	} else {
+		duration = 60 * time.Second // 1 minuto por defecto
+	}
+
+	// Tiempo de rampa (incremento gradual de threads)
+	if cfg.RampUp != "" {
+		rampUp, err = time.ParseDuration(cfg.RampUp)
+		if err != nil {
+			return fmt.Errorf("error al analizar el tiempo de rampa: %w", err)
+		}
+	} else {
+		rampUp = 0 // Sin rampa por defecto
+	}
+
+	r.log.Info(fmt.Sprintf("Iniciando prueba de stress con configuración:"))
+	r.log.Info(fmt.Sprintf("- Hilos mínimos: %d", minThreads))
+	r.log.Info(fmt.Sprintf("- Hilos máximos: %d", maxThreads))
+	r.log.Info(fmt.Sprintf("- Duración: %s", duration))
+	r.log.Info(fmt.Sprintf("- Tiempo de rampa: %s", rampUp))
+
+	startTime := time.Now()
+	endTime := startTime.Add(duration)
+	rampEndTime := startTime
+
+	// Si hay rampa, calcular cuando terminará
+	if rampUp > 0 {
+		rampEndTime = startTime.Add(rampUp)
+	}
+
+	// Variables para controlar la ejecución
+	var threadCount int = 0
+	var wg sync.WaitGroup
+
+	// Variables para calcular solicitudes por segundo en intervalos
+	lastRequestCount := 0
+	lastSampleTime := time.Now()
+
+	// Variables para el control preciso de la rampa
+	var totalThreadsToLaunch int
+	var remainingThreadsToLaunch int
+	var threadBatchInterval time.Duration
+	var nextBatchTime time.Time
+	var threadsPerBatch int
+
+	// Si hay rampa, preparar el lanzamiento por lotes
+	if rampUp > 0 && maxThreads > minThreads {
+		// Calcular cuántos hilos hay que lanzar durante la rampa
+		totalThreadsToLaunch = maxThreads - minThreads
+		remainingThreadsToLaunch = totalThreadsToLaunch
+
+		// Obtener el tamaño de lote configurado
+		batchSize := cfg.BatchSize
+
+		// Si el tamaño de lote no está configurado o es inválido, usar un valor por defecto
+		if batchSize <= 0 {
+			batchSize = 50 // Valor por defecto
+		}
+
+		// Calcular cuántos lotes necesitamos según el tamaño configurado
+		numBatches := totalThreadsToLaunch / batchSize
+		if numBatches < 1 {
+			numBatches = 1
+		}
+
+		// Recalcular el tamaño real de cada lote para distribuir uniformemente
+		threadsPerBatch = totalThreadsToLaunch / numBatches
+		if threadsPerBatch < 1 {
+			threadsPerBatch = 1
+		}
+
+		// Calcular el intervalo entre lotes
+		threadBatchInterval = rampUp / time.Duration(numBatches)
+
+		// Establecer cuándo se lanzará el primer lote
+		nextBatchTime = startTime.Add(threadBatchInterval)
+
+		r.log.Info(fmt.Sprintf("Configuración de rampa: lanzando ~%d hilos cada %s (configurado: %d hilos por lote)",
+			threadsPerBatch, threadBatchInterval, batchSize))
+	}
+
+	// Control de la tasa de creación de hilos
+	ticker := time.NewTicker(100 * time.Millisecond) // Aumentamos la frecuencia para mayor precisión
+	defer ticker.Stop()
+
+	// Ticker para muestrear la actividad de hilos
+	threadSampler := time.NewTicker(1 * time.Second)
+	defer threadSampler.Stop()
+
+	// Crear hilos iniciales (minThreads)
+	for i := 0; i < minThreads; i++ {
+		wg.Add(1)
+		threadCount++
+
+		// Incrementar el contador de hilos activos
+		atomic.AddInt32(&r.activeThreads, 1)
+
+		go func(threadNum int) {
+			defer wg.Done()
+			defer atomic.AddInt32(&r.activeThreads, -1)
+
+			// Ejecutar el hilo
+			r.executeThread(ctx, threadNum)
+		}(threadCount)
+	}
+
+	// Informar sobre los hilos iniciales
+	r.log.Info(fmt.Sprintf("%d hilos iniciales lanzados. Iniciando fase de rampa...", minThreads))
+
+mainLoop:
 	for {
 		select {
-		case logMsg, ok := <-r.responseLogCh:
-			if !ok {
-				// Canal cerrado, terminar
-				r.Logger.Debug("Canal de logs de respuestas cerrado, finalizando procesador")
-				return
+		case <-ctx.Done():
+			// Contexto cancelado (por ejemplo, Ctrl+C)
+			r.log.Info("Recibida señal de cancelación, deteniendo prueba...")
+			break mainLoop
+
+		case <-threadSampler.C:
+			// Registrar datos de actividad de hilos cada segundo
+			r.statsMutex.Lock()
+
+			// Obtener cantidad de hilos activos
+			activeThreads := int(atomic.LoadInt32(&r.activeThreads))
+
+			// Actualizar el máximo de hilos activos si es necesario
+			if activeThreads > r.testResult.MaxActiveThreads {
+				r.testResult.MaxActiveThreads = activeThreads
 			}
 
-			// Escribir el mensaje al buffer
-			if _, err := fmt.Fprintf(r.ResponseWriter, "%s\n", logMsg); err != nil {
-				r.Logger.Warnf("Error al escribir log de respuesta: %v", err)
+			// Calcular las solicitudes por segundo
+			now := time.Now()
+			elapsedSeconds := now.Sub(lastSampleTime).Seconds()
+			requestsPerSecond := 0.0
+
+			if elapsedSeconds > 0 {
+				requestDelta := r.testResult.TotalRequests - lastRequestCount
+				requestsPerSecond = float64(requestDelta) / elapsedSeconds
+				lastRequestCount = r.testResult.TotalRequests
+				lastSampleTime = now
 			}
 
-		case <-r.stopLogCh:
-			// Señal de terminación recibida
-			r.Logger.Debug("Señal de terminación recibida, finalizando procesador de logs")
-			return
-		}
-	}
-}
+			// Registrar datos de actividad
+			activityData := models.ThreadActivityData{
+				Timestamp:     now,
+				ActiveThreads: activeThreads,
+				RequestsPS:    requestsPerSecond,
+			}
 
-// Run ejecuta las pruebas
-func (r *Runner) Run() error {
-	r.Logger.Info("Iniciando pruebas de stress")
+			r.testResult.ThreadActivity = append(r.testResult.ThreadActivity, activityData)
 
-	// Cargar las fuentes de datos
-	if err := r.loadDataSources(); err != nil {
-		return fmt.Errorf("error al cargar las fuentes de datos: %w", err)
-	}
-
-	// Iniciar el recolector de resultados
-	resultCollector := make(chan *models.TestResult)
-	go r.collectResults(resultCollector)
-
-	// Si tenemos un ResponseWriter, iniciar el procesador de logs de respuestas
-	if r.ResponseWriter != nil {
-		go r.processResponseLogs()
-	}
-
-	// Si tenemos un bufferedWriter, iniciamos una goroutine para vaciarlo periódicamente
-	if r.bufferedWriter != nil {
-		stopFlushTimer := make(chan struct{})
-		go func() {
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-ticker.C:
-					// Vaciar el buffer periódicamente
-					r.Logger.Debug("Vaciando buffer del archivo de respuestas (periódico)")
-					if err := r.bufferedWriter.Flush(); err != nil {
-						r.Logger.Warnf("Error al vaciar el buffer de respuestas (periódico): %v", err)
-					}
-				case <-stopFlushTimer:
-					return
+			// Verificar si todos los hilos han sido lanzados y procesados
+			// Si ya alcanzamos el máximo de hilos configurado y no quedan más por lanzar
+			if threadCount >= maxThreads && remainingThreadsToLaunch <= 0 {
+				// Y si la actividad de hilos ha caído por debajo de un umbral mínimo (20% del máximo)
+				minimumActiveThreshold := int(float64(maxThreads) * 0.2)
+				if activeThreads <= minimumActiveThreshold {
+					r.log.Info(fmt.Sprintf("Todos los hilos lanzados (%d) y procesados. Finalizando prueba anticipadamente...", threadCount))
+					r.statsMutex.Unlock()
+					break mainLoop
 				}
 			}
-		}()
 
-		// Asegurar que el canal se cierre al terminar
-		defer func() {
-			close(stopFlushTimer)
-		}()
-	}
+			r.statsMutex.Unlock()
 
-	// Ejecutar las pruebas
-	r.StartTime = time.Now()
+			// Mostrar información en el log
+			r.log.Info(fmt.Sprintf("Hilos activos: %d, Solicitudes/s: %.2f", activeThreads, requestsPerSecond))
 
-	// Calcular la duración total
-	duration, err := time.ParseDuration(r.Config.GlobalConfig.Duration)
-	if err != nil {
-		return fmt.Errorf("error al parsear la duración: %w", err)
-	}
+		case <-ticker.C:
+			now := time.Now()
 
-	// Calcular el tiempo de rampa
-	rampUp, err := time.ParseDuration(r.Config.GlobalConfig.RampUp)
-	if err != nil {
-		return fmt.Errorf("error al parsear el tiempo de rampa: %w", err)
-	}
+			// Verificar si hemos excedido la duración total
+			if now.After(endTime) {
+				r.log.Info("Alcanzada duración de la prueba, deteniendo lanzamiento de nuevos hilos...")
+				break mainLoop
+			}
 
-	// Iniciar los hilos para cada servicio
-	for _, service := range r.Config.Services {
-		// Determinar el número de hilos mínimo y máximo para este servicio
-		minThreads := r.Config.GlobalConfig.MinThreads
-		maxThreads := r.Config.GlobalConfig.MaxThreads
+			// Manejar el lanzamiento de hilos durante la rampa
+			if rampUp > 0 && now.Before(rampEndTime) && remainingThreadsToLaunch > 0 {
+				// Verificar si es hora de lanzar un nuevo lote
+				if now.After(nextBatchTime) || now.Equal(nextBatchTime) {
+					// Calcular cuántos hilos lanzar en este lote
+					batchSize := threadsPerBatch
 
-		// Si se especifican a nivel de servicio, sobreescribir los valores globales
-		if service.MinThreads > 0 {
-			minThreads = service.MinThreads
-		}
-		if service.MaxThreads > 0 {
-			maxThreads = service.MaxThreads
-		}
-
-		// Para compatibilidad con versiones anteriores, si solo se especifica ThreadsPerSecond
-		if service.ThreadsPerSecond > 0 && service.MinThreads == 0 && service.MaxThreads == 0 {
-			minThreads = service.ThreadsPerSecond
-			maxThreads = service.ThreadsPerSecond
-		}
-
-		r.Logger.Infof("Servicio %s configurado con mínimo %d y máximo %d hilos", service.Name, minThreads, maxThreads)
-
-		// Verificar si hay datos suficientes para este servicio
-		if service.DataSourceName != "" {
-			if dataSource, ok := r.DataSource[service.DataSourceName]; ok {
-				// Verificar si es un LazyDataSource
-				if lazyDS, ok := dataSource.(*LazyDataSource); ok {
-					if lazyDS.Len() < maxThreads {
-						fmt.Printf("ADVERTENCIA: El servicio %s tiene menos registros (%d) que hilos máximos (%d). Los datos se reciclarán.\n",
-							service.Name, lazyDS.Len(), maxThreads)
-						r.Logger.Warnf("El servicio %s tiene menos registros (%d) que hilos máximos (%d). Los datos se reciclarán.",
-							service.Name, lazyDS.Len(), maxThreads)
+					// En los primeros lotes, podemos ser más agresivos
+					// Usar un tamaño de lote mayor para alcanzar más rápido el máximo
+					if threadCount < (maxThreads / 2) {
+						// Si estamos por debajo del 50% del objetivo, incrementar el tamaño del lote
+						batchSize = threadsPerBatch * 2
 					}
-				} else if records, ok := dataSource.([]models.DataRecord); ok {
-					// Compatibilidad con el código existente
-					if len(records) < maxThreads {
-						fmt.Printf("ADVERTENCIA: El servicio %s tiene menos registros (%d) que hilos máximos (%d). Los datos se reciclarán.\n",
-							service.Name, len(records), maxThreads)
-						r.Logger.Warnf("El servicio %s tiene menos registros (%d) que hilos máximos (%d). Los datos se reciclarán.",
-							service.Name, len(records), maxThreads)
+
+					if batchSize > remainingThreadsToLaunch {
+						batchSize = remainingThreadsToLaunch
 					}
+
+					r.log.Info(fmt.Sprintf("Lanzando lote de %d hilos adicionales", batchSize))
+
+					// Lanzar el lote de hilos con un poco de paralelismo para acelerar
+					// el lanzamiento de los hilos
+					launchWg := sync.WaitGroup{}
+					currentThreadCount := threadCount // Guardar el valor actual para calcular índices
+					threadCount += batchSize          // Actualizar antes para evitar condiciones de carrera
+
+					// Usamos goroutines para lanzar los hilos en paralelo en grupos de 20
+					for i := 0; i < batchSize; i += 20 {
+						launchWg.Add(1)
+						go func(startIdx, count int) {
+							defer launchWg.Done()
+
+							endIdx := startIdx + count
+							if endIdx > batchSize {
+								endIdx = batchSize
+							}
+
+							for j := startIdx; j < endIdx; j++ {
+								wg.Add(1)
+								localThreadNum := currentThreadCount + 1 + j
+
+								// Incrementar el contador de hilos activos
+								atomic.AddInt32(&r.activeThreads, 1)
+
+								go func(threadNum int) {
+									defer wg.Done()
+									defer atomic.AddInt32(&r.activeThreads, -1)
+
+									// Ejecutar el hilo
+									r.executeThread(ctx, threadNum)
+								}(localThreadNum)
+							}
+						}(i, 20)
+					}
+
+					// Esperar a que todos los hilos se hayan lanzado
+					launchWg.Wait()
+
+					// Actualizar contadores y programar el próximo lote
+					remainingThreadsToLaunch -= batchSize
+					nextBatchTime = nextBatchTime.Add(threadBatchInterval)
+
+					r.log.Info(fmt.Sprintf("Total de hilos lanzados: %d, Restantes por lanzar: %d",
+						threadCount, remainingThreadsToLaunch))
+				}
+			} else if rampUp > 0 && now.After(rampEndTime) && threadCount < maxThreads {
+				// Si ya pasó el tiempo de rampa pero aún no se han lanzado todos los hilos,
+				// lanzar los hilos restantes de una vez
+				remainingThreads := maxThreads - threadCount
+
+				if remainingThreads > 0 {
+					r.log.Info(fmt.Sprintf("Fin de rampa. Lanzando %d hilos restantes para alcanzar el máximo", remainingThreads))
+
+					// Lanzamiento paralelo de los hilos restantes
+					launchWg := sync.WaitGroup{}
+					currentThreadCount := threadCount
+					threadCount += remainingThreads
+
+					// Lanzar los hilos restantes en paralelo en grupos de 20
+					for i := 0; i < remainingThreads; i += 20 {
+						launchWg.Add(1)
+						go func(startIdx, count int) {
+							defer launchWg.Done()
+
+							endIdx := startIdx + count
+							if endIdx > remainingThreads {
+								endIdx = remainingThreads
+							}
+
+							for j := startIdx; j < endIdx; j++ {
+								wg.Add(1)
+								localThreadNum := currentThreadCount + 1 + j
+
+								// Incrementar el contador de hilos activos
+								atomic.AddInt32(&r.activeThreads, 1)
+
+								go func(threadNum int) {
+									defer wg.Done()
+									defer atomic.AddInt32(&r.activeThreads, -1)
+
+									// Ejecutar el hilo
+									r.executeThread(ctx, threadNum)
+								}(localThreadNum)
+							}
+						}(i, 20)
+					}
+
+					// Esperar a que se lancen todos los hilos
+					launchWg.Wait()
+
+					r.log.Info(fmt.Sprintf("Todos los %d hilos han sido lanzados", maxThreads))
 				}
 			}
 		}
-
-		// Si min y max son iguales o no hay tiempo de rampa, iniciar todos los hilos directamente
-		if minThreads == maxThreads || rampUp == 0 {
-			r.Logger.Infof("Iniciando %d hilos por segundo para el servicio %s", maxThreads, service.Name)
-
-			// Iniciar todos los hilos a la vez
-			for i := 0; i < maxThreads; i++ {
-				r.WaitGroup.Add(1)
-				go r.runServiceThread(i+1, service)
-			}
-		} else {
-			// Implementar rampa desde min hasta max hilos
-			r.Logger.Infof("Iniciando rampa de %d a %d hilos para el servicio %s en %s",
-				minThreads, maxThreads, service.Name, rampUp)
-
-			// Iniciar los hilos mínimos inmediatamente
-			for i := 0; i < minThreads; i++ {
-				r.WaitGroup.Add(1)
-				go r.runServiceThread(i+1, service)
-			}
-
-			// Si hay diferencia entre min y max, distribuir los hilos adicionales
-			// durante el tiempo de rampa
-			threadsToRamp := maxThreads - minThreads
-			if threadsToRamp > 0 {
-				// Calculamos el tiempo de espera entre hilos durante la rampa
-				interval := rampUp / time.Duration(threadsToRamp)
-
-				// Iniciar los hilos adicionales gradualmente
-				for i := 0; i < threadsToRamp; i++ {
-					time.Sleep(interval)
-					r.WaitGroup.Add(1)
-					go r.runServiceThread(minThreads+i+1, service)
-				}
-			}
-		}
 	}
-
-	// Modificado: Esperar únicamente a que termine la duración
-	// Esto asegura que la prueba dure exactamente el tiempo especificado
-	r.Logger.Infof("Esperando %s para que termine la prueba", duration)
-	time.Sleep(duration)
-
-	// Señalizar a todos los hilos que deben terminar
-	close(r.StopChan)
-	r.Logger.Info("Tiempo de prueba completado, esperando a que terminen los hilos")
 
 	// Esperar a que todos los hilos terminen
-	r.WaitGroup.Wait()
-	r.Logger.Info("Todos los hilos han terminado")
+	activeThreads := atomic.LoadInt32(&r.activeThreads)
+	r.log.Info(fmt.Sprintf("Esperando a que terminen %d hilos activos...", activeThreads))
 
-	// Cerrar el canal de resultados
-	close(r.Results)
+	// Proporcionar un periodo de gracia para que terminen las peticiones en curso
+	gracePeriod := 5 * time.Second
+	r.log.Info(fmt.Sprintf("Esperando un periodo de gracia de %s para terminar las peticiones en curso...", gracePeriod))
+	time.Sleep(gracePeriod)
 
-	// Esperar a que termine el recolector de resultados
-	result := <-resultCollector
-	r.EndTime = time.Now()
+	// Ahora sí podemos cancelar el contexto
+	cancel()
 
-	// Cerrar el canal de logs de respuestas y esperar a que se complete el procesamiento
-	if r.responseLogCh != nil {
-		r.Logger.Info("Cerrando sistema de logs de respuestas")
-		close(r.responseLogCh)
-		// Enviar señal para terminar la goroutine
-		close(r.stopLogCh)
-	}
+	// Esperar a que terminen todos los hilos
+	wg.Wait()
 
-	// Vaciar el buffer del escritor de respuestas si existe
-	if r.bufferedWriter != nil {
-		r.Logger.Info("Vaciando buffer del archivo de respuestas (final)")
-		if err := r.bufferedWriter.Flush(); err != nil {
-			r.Logger.Warnf("Error al vaciar el buffer de respuestas (final): %v", err)
-		}
-	}
+	// Registrar hora de finalización
+	r.testResult.EndTime = time.Now()
 
 	// Generar el reporte
-	r.Logger.Info("Generando reporte")
-	if err := r.generateReport(result); err != nil {
-		return fmt.Errorf("error al generar el reporte: %w", err)
-	}
-
-	r.Logger.Info("Pruebas completadas")
-	return nil
-}
-
-// loadDataSources carga las fuentes de datos
-func (r *Runner) loadDataSources() error {
-	for name, source := range r.Config.DataSources.CSV {
-		r.Logger.Infof("Cargando fuente de datos CSV: %s", name)
-
-		// Abrir el archivo CSV
-		file, err := os.Open(source.Path)
+	if r.cfg.ReportDir != "" {
+		r.log.Info(fmt.Sprintf("Generando reporte en %s...", r.cfg.ReportDir))
+		reportPath, err := reporter.GenerateReport(r.testResult, r.cfg.ReportDir)
 		if err != nil {
-			return fmt.Errorf("error al abrir el archivo CSV %s: %w", source.Path, err)
-		}
-
-		// Crear el lector CSV
-		reader := csv.NewReader(file)
-		if source.Delimiter != "" {
-			reader.Comma = rune(source.Delimiter[0])
-		}
-
-		// Leer las cabeceras
-		var headers []string
-		if source.HasHeader {
-			headers, err = reader.Read()
-			if err != nil {
-				file.Close()
-				return fmt.Errorf("error al leer las cabeceras del CSV %s: %w", source.Path, err)
-			}
-		}
-
-		// Contar el número de registros sin cargarlos todos en memoria
-		var recordCount int
-
-		// Crear un nuevo archivo para contar registros
-		countFile, err := os.Open(source.Path)
-		if err != nil {
-			file.Close()
-			return fmt.Errorf("error al abrir el archivo CSV para contar registros %s: %w", source.Path, err)
-		}
-
-		countReader := csv.NewReader(countFile)
-		if source.Delimiter != "" {
-			countReader.Comma = rune(source.Delimiter[0])
-		}
-
-		// Saltar la cabecera si existe
-		if source.HasHeader {
-			_, err = countReader.Read()
-			if err != nil {
-				file.Close()
-				countFile.Close()
-				return fmt.Errorf("error al saltar la cabecera para contar registros %s: %w", source.Path, err)
-			}
-		}
-
-		// Contar registros
-		for {
-			_, err := countReader.Read()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				file.Close()
-				countFile.Close()
-				return fmt.Errorf("error al contar registros del CSV %s: %w", source.Path, err)
-			}
-			recordCount++
-		}
-		countFile.Close()
-
-		// Calcular el tamaño óptimo del bloque y la caché
-		blockSize := 1000
-		maxCacheSize := 10000 // Limitar la caché a 10,000 registros para evitar consumo excesivo de memoria
-
-		// Para archivos muy grandes, ajustar el tamaño del bloque
-		if recordCount > 100000 {
-			blockSize = 5000
-		}
-
-		// Crear un DataSource que implementa carga perezosa con caché por bloques y LRU
-		r.DataSource[name] = &LazyDataSource{
-			file:         file,
-			reader:       reader,
-			headers:      headers,
-			hasHeader:    source.HasHeader,
-			recordCount:  recordCount,
-			path:         source.Path,
-			cache:        make(map[int]models.DataRecord),
-			blockSize:    blockSize,
-			delimiter:    reader.Comma,
-			maxCacheSize: maxCacheSize,
-			lruList:      make([]int, 0, maxCacheSize),
-		}
-
-		r.Logger.Infof("Fuente de datos CSV %s preparada con %d registros disponibles", name, recordCount)
-	}
-
-	return nil
-}
-
-// LazyDataSource implementa una fuente de datos con carga perezosa y caché por bloques
-type LazyDataSource struct {
-	file         *os.File
-	reader       *csv.Reader
-	headers      []string
-	hasHeader    bool
-	recordCount  int
-	path         string
-	mutex        sync.Mutex
-	cache        map[int]models.DataRecord // Caché de registros por índice
-	blockSize    int                       // Tamaño del bloque para la carga
-	delimiter    rune                      // Delimitador para el CSV
-	maxCacheSize int                       // Tamaño máximo de la caché
-	lruList      []int                     // Lista de índices usados recientemente (LRU)
-}
-
-// Len devuelve el número de registros en la fuente de datos
-func (lds *LazyDataSource) Len() int {
-	return lds.recordCount
-}
-
-// Get obtiene un registro por su índice, cargándolo si es necesario
-func (lds *LazyDataSource) Get(index int) (models.DataRecord, error) {
-	// Verificar que el índice sea válido
-	if index < 0 || index >= lds.recordCount {
-		return nil, fmt.Errorf("índice fuera de rango: %d (máximo: %d)", index, lds.recordCount-1)
-	}
-
-	lds.mutex.Lock()
-	defer lds.mutex.Unlock()
-
-	// Verificar si el registro ya está en caché
-	if record, exists := lds.cache[index]; exists {
-		// Actualizar la lista LRU (mover este índice al final)
-		lds.updateLRU(index)
-		return record, nil
-	}
-
-	// Calcular el bloque al que pertenece este índice
-	blockStart := (index / lds.blockSize) * lds.blockSize
-
-	// Cerrar y reabrir el archivo para posicionarnos al inicio
-	lds.file.Close()
-	file, err := os.Open(lds.path)
-	if err != nil {
-		return nil, fmt.Errorf("error al reabrir el archivo CSV %s: %w", lds.path, err)
-	}
-	lds.file = file
-
-	// Recrear el lector
-	lds.reader = csv.NewReader(lds.file)
-	if lds.delimiter != 0 {
-		lds.reader.Comma = lds.delimiter
-	}
-
-	// Saltar la cabecera si existe
-	if lds.hasHeader {
-		_, err = lds.reader.Read()
-		if err != nil {
-			return nil, fmt.Errorf("error al saltar la cabecera: %w", err)
-		}
-	}
-
-	// Saltar registros hasta llegar al inicio del bloque
-	for i := 0; i < blockStart; i++ {
-		_, err = lds.reader.Read()
-		if err != nil {
-			if err == io.EOF {
-				// Si llegamos al final, volver al inicio y empezar de nuevo
-				return lds.Get(index % blockStart) // Reciclar registros
-			}
-			return nil, fmt.Errorf("error al saltar al bloque %d: %w", blockStart, err)
-		}
-	}
-
-	// Cargar el bloque completo o hasta el final del archivo
-	blockEnd := blockStart + lds.blockSize
-	if blockEnd > lds.recordCount {
-		blockEnd = lds.recordCount
-	}
-
-	// Verificar si necesitamos liberar espacio en la caché
-	if lds.maxCacheSize > 0 && len(lds.cache)+(blockEnd-blockStart) > lds.maxCacheSize {
-		lds.evictLRU(blockEnd - blockStart)
-	}
-
-	// Leer los registros del bloque
-	for i := blockStart; i < blockEnd; i++ {
-		record, err := lds.reader.Read()
-		if err != nil {
-			if err == io.EOF {
-				// Si llegamos al final antes de lo esperado, puede ser un error en el conteo
-				break
-			}
-			return nil, fmt.Errorf("error al leer el registro %d: %w", i, err)
-		}
-
-		// Crear el registro de datos
-		dataRecord := make(models.DataRecord)
-
-		// Si hay cabeceras, usar los nombres de las columnas
-		if lds.hasHeader {
-			for j, value := range record {
-				if j < len(lds.headers) {
-					dataRecord[lds.headers[j]] = value
-				}
-			}
+			r.log.Error(fmt.Sprintf("Error al generar el reporte: %s", err.Error()))
 		} else {
-			// Si no hay cabeceras, usar los índices como nombres
-			for j, value := range record {
-				dataRecord[fmt.Sprintf("column%d", j+1)] = value
-			}
-		}
-
-		// Añadir el registro a la caché
-		lds.cache[i] = dataRecord
-		// Actualizar la lista LRU
-		lds.lruList = append(lds.lruList, i)
-	}
-
-	// Verificar si el registro solicitado está ahora en caché
-	if record, exists := lds.cache[index]; exists {
-		return record, nil
-	}
-
-	// Si no está en caché, puede ser que hayamos llegado al final del archivo
-	// En este caso, reciclamos y devolvemos un registro del inicio
-	if len(lds.cache) > 0 {
-		// Buscar el primer registro disponible en la caché
-		for i := 0; i < lds.recordCount; i++ {
-			if record, exists := lds.cache[i]; exists {
-				return record, nil
-			}
+			r.log.Info(fmt.Sprintf("Reporte generado: %s", reportPath))
 		}
 	}
 
-	return nil, fmt.Errorf("no se pudo cargar el registro %d", index)
+	r.log.Info(fmt.Sprintf("Prueba de stress completada. Total hilos ejecutados: %d", threadCount))
+	r.log.Info(fmt.Sprintf("Total solicitudes: %d (Exitosas: %d, Fallidas: %d)",
+		r.testResult.TotalRequests, r.testResult.SuccessRequests, r.testResult.FailedRequests))
+
+	return nil
 }
 
-// updateLRU actualiza la lista LRU moviendo el índice al final
-func (lds *LazyDataSource) updateLRU(index int) {
-	// Buscar el índice en la lista LRU
-	for i, idx := range lds.lruList {
-		if idx == index {
-			// Eliminar el índice de su posición actual
-			lds.lruList = append(lds.lruList[:i], lds.lruList[i+1:]...)
-			// Añadirlo al final (más recientemente usado)
-			lds.lruList = append(lds.lruList, index)
-			break
-		}
-	}
-}
+// executeThread ejecuta un hilo de prueba procesando todos los servicios configurados
+func (r *Runner) executeThread(ctx context.Context, threadNum int) {
+	// Clonar el mapa de variables para este hilo
+	threadVars := r.cloneVariables()
 
-// evictLRU elimina los registros menos usados recientemente de la caché
-func (lds *LazyDataSource) evictLRU(needSpace int) {
-	// Eliminar registros hasta tener suficiente espacio
-	for i := 0; i < needSpace && len(lds.lruList) > 0; i++ {
-		// Eliminar el primer elemento (menos usado recientemente)
-		lruIndex := lds.lruList[0]
-		delete(lds.cache, lruIndex)
-		lds.lruList = lds.lruList[1:]
-	}
-}
+	r.log.Debug(fmt.Sprintf("Hilo %d iniciado", threadNum))
 
-// Close cierra el archivo CSV
-func (lds *LazyDataSource) Close() error {
-	return lds.file.Close()
-}
+	// Ejecutar los servicios en ciclos para mantener el hilo activo más tiempo
+	// Definimos un número de ciclos que variará según el número del hilo
+	// Hilos con números menores tendrán más ciclos para quedarse activos más tiempo
+	// 10 ciclos para los primeros hilos, 2 para los últimos
+	maxCycles := 10
+	minCycles := 2
+	totalThreadsRange := 500.0 // Asumimos un rango máximo de 500 hilos
 
-// runServiceThread ejecuta un hilo de prueba para un servicio específico
-func (r *Runner) runServiceThread(id int, service *config.Service) {
-	defer r.WaitGroup.Done()
-
-	r.Logger.Infof("Iniciando hilo %d para el servicio %s", id, service.Name)
-
-	// Crear el contexto del hilo
-	var threadContext *models.ThreadContext
-
-	// Si el servicio depende de otro, verificar que se haya ejecutado
-	if service.DependsOn != "" {
-		// Buscar el servicio del que depende
-		var dependentService *config.Service
-		for _, s := range r.Config.Services {
-			if s.Name == service.DependsOn {
-				dependentService = s
-				break
-			}
-		}
-
-		if dependentService == nil {
-			r.Logger.Warnf("El servicio %s depende de %s, pero este no existe", service.Name, service.DependsOn)
-			return
-		}
-
-		// Ejecutar el servicio del que depende para obtener el token
-		tempThreadContext := models.NewThreadContext(id, nil)
-
-		// Si el servicio dependiente usa una fuente de datos, obtener un registro
-		if dependentService.DataSourceName != "" {
-			if dataSource, ok := r.DataSource[dependentService.DataSourceName]; ok {
-				// Verificar si es un LazyDataSource
-				if lazyDS, ok := dataSource.(*LazyDataSource); ok {
-					// Seleccionar un registro basado en el ID del hilo, ciclando si es necesario
-					recordIndex := (id - 1) % lazyDS.Len()
-					data, err := lazyDS.Get(recordIndex)
-					if err != nil {
-						r.Logger.WithError(err).Errorf("Error al obtener el registro %d para el servicio dependiente %s",
-							recordIndex, dependentService.Name)
-						return
-					}
-					tempThreadContext.Data = data
-				} else {
-					// Compatibilidad con el código existente (registros ya cargados)
-					records, ok := dataSource.([]models.DataRecord)
-					if !ok {
-						r.Logger.Warnf("Tipo de fuente de datos no compatible para el servicio dependiente %s", dependentService.Name)
-						return
-					}
-
-					if len(records) > 0 {
-						// Seleccionar un registro basado en el ID del hilo, ciclando si es necesario
-						recordIndex := (id - 1) % len(records)
-						tempThreadContext.Data = records[recordIndex]
-					}
-				}
-			}
-		}
-
-		cachedDependency := false
-
-		if dependentService.CacheToken {
-			// Comprobar si el token existe y si ha expirado
-			if token, ok := models.GetGlobalTokenStore().GetToken(dependentService.TokenName); ok {
-				tempThreadContext.TokenStore.SetToken(dependentService.TokenName, token)
-				cachedDependency = true
-			} else {
-				r.Logger.Warnf("No se pudo obtener el token para %s", dependentService.TokenName)
-			}
-		}
-
-		if !cachedDependency {
-			// Ejecutar el servicio dependiente para obtener el token
-			depResp, err := r.executeService(dependentService, tempThreadContext)
-			if err != nil {
-				r.Logger.WithError(err).Errorf("Error al ejecutar el servicio dependiente %s", dependentService.Name)
-				return
-			}
-
-			// Si el servicio extrae un token, guardarlo
-			if dependentService.ExtractToken != "" && dependentService.TokenName != "" {
-				// Parsear la respuesta como JSON
-				if depResp.Body != nil {
-					// Extraer el token usando gjson
-					token := gjson.GetBytes(depResp.Body, dependentService.ExtractToken).String()
-					if token != "" {
-						// Si se ha configurado la caché con tiempo de expiración
-						if dependentService.CacheToken && dependentService.TokenExpiry != "" {
-							expiryDuration, err := time.ParseDuration(dependentService.TokenExpiry)
-							if err != nil {
-								r.Logger.Warnf("Error al parsear la duración de expiración del token para %s: %v", dependentService.TokenName, err)
-								// Si hay error, usar SetToken normal
-								tempThreadContext.TokenStore.SetToken(dependentService.TokenName, token)
-								// También establecer en el almacén global si es un servicio de autenticación
-								if dependentService.IsAuthService {
-									models.GetGlobalTokenStore().SetToken(dependentService.TokenName, token)
-									r.Logger.Infof("Token de autenticación global actualizado para %s", dependentService.TokenName)
-								}
-							} else {
-								tempThreadContext.TokenStore.SetTokenWithExpiry(dependentService.TokenName, token, expiryDuration)
-								// También establecer en el almacén global si es un servicio de autenticación
-								if dependentService.IsAuthService {
-									models.GetGlobalTokenStore().SetTokenWithExpiry(dependentService.TokenName, token, expiryDuration)
-									r.Logger.Infof("Token de autenticación global actualizado para %s con expiración de %s", dependentService.TokenName, dependentService.TokenExpiry)
-								}
-								r.Logger.Debugf("Token actualizado para %s con expiración de %s", dependentService.TokenName, dependentService.TokenExpiry)
-							}
-						} else {
-							// Comportamiento estándar sin caché con tiempo
-							tempThreadContext.TokenStore.SetToken(dependentService.TokenName, token)
-							// También establecer en el almacén global si es un servicio de autenticación
-							if dependentService.IsAuthService {
-								models.GetGlobalTokenStore().SetToken(dependentService.TokenName, token)
-								r.Logger.Infof("Token de autenticación global actualizado para %s", dependentService.TokenName)
-							}
-							r.Logger.Debugf("Token actualizado para el servicio dependiente %s: %s", dependentService.TokenName, token)
-						}
-					} else {
-						r.Logger.Warnf("No se pudo extraer el token para %s", dependentService.TokenName)
-					}
-				}
-			}
-		}
-
-		// Usar el contexto del hilo temporal
-		threadContext = tempThreadContext
+	cycles := maxCycles - int(float64(threadNum)/totalThreadsRange*float64(maxCycles-minCycles))
+	if cycles < minCycles {
+		cycles = minCycles
 	}
 
-	// Si el servicio usa una fuente de datos, obtener un registro
-	var data models.DataRecord
-	if service.DataSourceName != "" {
-		if dataSource, ok := r.DataSource[service.DataSourceName]; ok {
-			// Verificar si es un LazyDataSource
-			if lazyDS, ok := dataSource.(*LazyDataSource); ok {
-				// Verificar si hay menos registros que hilos y mostrar advertencia
-				threadsPerSecond := service.ThreadsPerSecond
-				if threadsPerSecond == 0 {
-					threadsPerSecond = r.Config.GlobalConfig.ThreadsPerSecond
-				}
-				if lazyDS.Len() < threadsPerSecond {
-					r.Logger.Warnf("El servicio %s tiene menos registros (%d) que hilos (%d). Los datos se reciclarán.",
-						service.Name, lazyDS.Len(), threadsPerSecond)
-				}
+	r.log.Debug(fmt.Sprintf("Hilo %d ejecutará %d ciclos", threadNum, cycles))
 
-				// Seleccionar un registro basado en el ID del hilo, ciclando si es necesario
-				recordIndex := (id - 1) % lazyDS.Len()
-				var err error
-				data, err = lazyDS.Get(recordIndex)
-				if err != nil {
-					r.Logger.WithError(err).Errorf("Error al obtener el registro %d para el servicio %s",
-						recordIndex, service.Name)
-					return
-				}
-
-				// Mostrar información detallada sobre el registro utilizado
-				r.Logger.Infof("Hilo %d usando registro %d de %d para el servicio %s",
-					id, recordIndex+1, lazyDS.Len(), service.Name)
-
-				// Mostrar los datos del registro
-				for k, v := range data {
-					r.Logger.Infof("  - %s: %s", k, v)
-				}
-			} else {
-				// Compatibilidad con el código existente (registros ya cargados)
-				records, ok := dataSource.([]models.DataRecord)
-				if !ok {
-					r.Logger.Warnf("Tipo de fuente de datos no compatible para el servicio %s", service.Name)
-					return
-				}
-
-				if len(records) > 0 {
-					// Seleccionar un registro basado en el ID del hilo, ciclando si es necesario
-					recordIndex := (id - 1) % len(records)
-					data = records[recordIndex]
-				}
-			}
-		}
-	}
-
-	// Si no hay un contexto de hilo, crearlo
-	if threadContext == nil {
-		threadContext = models.NewThreadContext(id, data)
-	} else if data != nil {
-		// Si ya hay un contexto pero no tiene datos, agregarlos
-		threadContext.Data = data
-	}
-
-	// Contador para llevar un registro del número de ejecuciones
-	executionCount := 0
-
-	// Bucle principal: ejecutar hasta recibir señal de terminación
-	for {
+	for cycle := 0; cycle < cycles; cycle++ {
+		// Verificar si el contexto ya fue cancelado
 		select {
-		case <-r.StopChan:
-			// Señal de terminación recibida
-			r.Logger.Debugf("Hilo %d del servicio %s terminando después de %d ejecuciones",
-				id, service.Name, executionCount)
+		case <-ctx.Done():
+			r.log.Debug(fmt.Sprintf("Hilo %d cancelado (fin de prueba) en ciclo %d", threadNum, cycle))
 			return
 		default:
 			// Continuar con la ejecución
-			executionCount++
+		}
 
-			// Si este es un servicio que depende de otro y ejecutamos más de una vez,
-			// puede ser necesario actualizar el token
-			if service.DependsOn != "" && executionCount > 1 {
-				// Buscar el servicio del que depende
-				var dependentService *config.Service
-				for _, s := range r.Config.Services {
-					if s.Name == service.DependsOn {
-						dependentService = s
-						break
-					}
-				}
+		r.log.Debug(fmt.Sprintf("Hilo %d: Iniciando ciclo %d/%d", threadNum, cycle+1, cycles))
 
-				if dependentService != nil {
-					// Verificar si necesitamos actualizar el token
-					tokenNeedsUpdate := true
-
-					// Primero verificamos si es un servicio de autenticación con token global
-					if dependentService.IsAuthService && dependentService.TokenName != "" {
-						// Comprobar si el token existe y si ha expirado en el almacén global
-						if !models.GetGlobalTokenStore().IsTokenExpired(dependentService.TokenName) {
-							// El token global no ha expirado, no necesita actualización
-							tokenNeedsUpdate = false
-							r.Logger.Debugf("Usando token global para %s que no ha expirado", dependentService.TokenName)
-						} else {
-							r.Logger.Debugf("Token global para %s ha expirado o no existe, actualizando", dependentService.TokenName)
-						}
-					} else if dependentService.CacheToken && dependentService.TokenName != "" {
-						// Si no es un servicio de autenticación global o el token global ha expirado,
-						// verificamos el token local del hilo
-						// Comprobar si el token local existe y si ha expirado
-						if !threadContext.TokenStore.IsTokenExpired(dependentService.TokenName) {
-							// El token local no ha expirado, no necesita actualización
-							tokenNeedsUpdate = false
-						} else {
-							r.Logger.Debugf("Token para %s ha expirado, actualizando", dependentService.TokenName)
-						}
-					}
-
-					if tokenNeedsUpdate {
-						// Ejecutar el servicio dependiente para actualizar el token
-						depResp, err := r.executeService(dependentService, threadContext)
-						if err != nil {
-							r.Logger.WithError(err).Errorf("Error al actualizar el token del servicio dependiente %s", dependentService.Name)
-							// Esperar un momento antes de reintentar
-							time.Sleep(500 * time.Millisecond)
-							continue
-						}
-
-						// Si el servicio extrae un token, actualizarlo
-						if dependentService.ExtractToken != "" && dependentService.TokenName != "" && depResp.Body != nil {
-							token := gjson.GetBytes(depResp.Body, dependentService.ExtractToken).String()
-							if token != "" {
-								// Si se ha configurado la caché con tiempo de expiración
-								if dependentService.CacheToken && dependentService.TokenExpiry != "" {
-									expiryDuration, err := time.ParseDuration(dependentService.TokenExpiry)
-									if err != nil {
-										r.Logger.Warnf("Error al parsear la duración de expiración del token para %s: %v", dependentService.TokenName, err)
-										// Si hay error, usar SetToken normal
-										threadContext.TokenStore.SetToken(dependentService.TokenName, token)
-										// También establecer en el almacén global si es un servicio de autenticación
-										if dependentService.IsAuthService {
-											models.GetGlobalTokenStore().SetToken(dependentService.TokenName, token)
-											r.Logger.Infof("Token de autenticación global actualizado para %s", dependentService.TokenName)
-										}
-									} else {
-										threadContext.TokenStore.SetTokenWithExpiry(dependentService.TokenName, token, expiryDuration)
-										// También establecer en el almacén global si es un servicio de autenticación
-										if dependentService.IsAuthService {
-											models.GetGlobalTokenStore().SetTokenWithExpiry(dependentService.TokenName, token, expiryDuration)
-											r.Logger.Infof("Token de autenticación global actualizado para %s con expiración de %s", dependentService.TokenName, dependentService.TokenExpiry)
-										}
-										r.Logger.Debugf("Token actualizado para %s con expiración de %s", dependentService.TokenName, dependentService.TokenExpiry)
-									}
-								} else {
-									// Comportamiento estándar sin caché con tiempo
-									threadContext.TokenStore.SetToken(dependentService.TokenName, token)
-									// También establecer en el almacén global si es un servicio de autenticación
-									if dependentService.IsAuthService {
-										models.GetGlobalTokenStore().SetToken(dependentService.TokenName, token)
-										r.Logger.Infof("Token de autenticación global actualizado para %s", dependentService.TokenName)
-									}
-									r.Logger.Debugf("Token actualizado para el servicio dependiente %s: %s", dependentService.TokenName, token)
-								}
-							}
-						}
-					}
-				}
+		// Ejecutar cada servicio en el orden definido
+		for i, service := range r.cfg.Services {
+			// Verificar si el contexto ya fue cancelado
+			select {
+			case <-ctx.Done():
+				r.log.Debug(fmt.Sprintf("Hilo %d cancelado (fin de prueba) en ciclo %d, servicio %s",
+					threadNum, cycle, service.Name))
+				return
+			default:
+				// Continuar con la ejecución
 			}
 
-			// Ejecutar el servicio
-			resp, err := r.executeService(service, threadContext)
-			if err != nil {
-				r.Logger.WithError(err).Errorf("Error al ejecutar el servicio %s (ejecución %d)",
-					service.Name, executionCount)
-				// Esperar un momento antes de reintentar
-				time.Sleep(500 * time.Millisecond)
+			// Loguear progreso de servicios
+			r.log.Debug(fmt.Sprintf("Hilo %d, Ciclo %d/%d: Ejecutando servicio %d/%d: %s",
+				threadNum, cycle+1, cycles, i+1, len(r.cfg.Services), service.Name))
+
+			// Si el servicio depende de otro, verificar que tengamos las variables necesarias
+			if service.DependsOn != "" && threadVars[service.DependsOn] == "" {
+				r.log.Debug(fmt.Sprintf("Hilo %d: Omitiendo servicio %s porque depende de %s que no está disponible",
+					threadNum, service.Name, service.DependsOn))
 				continue
 			}
 
-			// Enviar el resultado
-			r.Results <- resp
-
-			// Si el servicio extrae un token, guardarlo
-			if service.ExtractToken != "" && service.TokenName != "" && resp.Body != nil {
-				token := gjson.GetBytes(resp.Body, service.ExtractToken).String()
-				if token != "" {
-					// Si se ha configurado la caché con tiempo de expiración
-					if service.CacheToken && service.TokenExpiry != "" {
-						expiryDuration, err := time.ParseDuration(service.TokenExpiry)
-						if err != nil {
-							r.Logger.Warnf("Error al parsear la duración de expiración del token para %s: %v", service.TokenName, err)
-							// Si hay error, usar SetToken normal
-							threadContext.TokenStore.SetToken(service.TokenName, token)
-							// También guardar en el almacén global para compartir entre hilos
-							r.GlobalTokens.SetToken(service.TokenName, token)
-							r.Logger.Infof("Token global actualizado para %s", service.TokenName)
-						} else {
-							threadContext.TokenStore.SetTokenWithExpiry(service.TokenName, token, expiryDuration)
-							// También guardar en el almacén global para compartir entre hilos
-							r.GlobalTokens.SetTokenWithExpiry(service.TokenName, token, expiryDuration)
-							r.Logger.Infof("Token global actualizado para %s con expiración de %s", service.TokenName, service.TokenExpiry)
-
-							if executionCount == 1 || executionCount%100 == 0 {
-								r.Logger.Infof("Token extraído para %s con expiración de %s", service.TokenName, service.TokenExpiry)
-							} else {
-								r.Logger.Debugf("Token extraído para %s con expiración de %s", service.TokenName, service.TokenExpiry)
-							}
-						}
-					} else {
-						// Comportamiento estándar sin caché con tiempo
-						threadContext.TokenStore.SetToken(service.TokenName, token)
-						// También guardar en el almacén global para compartir entre hilos
-						r.GlobalTokens.SetToken(service.TokenName, token)
-						r.Logger.Infof("Token global actualizado para %s", service.TokenName)
-
-						if executionCount == 1 || executionCount%100 == 0 {
-							// Solo mostrar el token en la primera ejecución o cada 100 ejecuciones para no saturar los logs
-							r.Logger.Infof("Token extraído para %s: %s", service.TokenName, token)
-						} else {
-							r.Logger.Debugf("Token extraído para %s: %s", service.TokenName, token)
-						}
-					}
-				} else {
-					r.Logger.Warnf("No se pudo extraer el token para %s", service.TokenName)
-				}
-			}
-
-			if executionCount == 1 {
-				r.Logger.Infof("Hilo %d del servicio %s completó su primera ejecución", id, service.Name)
-			} else if executionCount%100 == 0 {
-				// Mostrar progreso cada 100 ejecuciones
-				r.Logger.Infof("Hilo %d del servicio %s ha ejecutado %d veces", id, service.Name, executionCount)
-			}
-
-			// Pequeña pausa para no saturar el sistema, especialmente si hay muchos hilos
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-}
-
-// executeService ejecuta un servicio
-func (r *Runner) executeService(service *config.Service, ctx *models.ThreadContext) (*models.Response, error) {
-	// Preparar la URL
-	url := service.URL
-
-	// Preparar el cuerpo de la solicitud
-	var body []byte
-	var err error
-	var req *http.Request
-
-	// Determinar el tipo de contenido
-	contentType := service.ContentType
-	if contentType == "" {
-		// Si no se especifica, intentar inferirlo de las cabeceras
-		if ct, ok := service.Headers["Content-Type"]; ok {
-			if strings.Contains(ct, "application/x-www-form-urlencoded") {
-				contentType = "form"
-			} else if strings.Contains(ct, "application/json") {
-				contentType = "json"
-			}
-		} else {
-			// Por defecto, usar JSON
-			contentType = "json"
-		}
-	}
-
-	// Manejar peticiones form-urlencoded
-	if contentType == "form" {
-		if len(service.FormData) > 0 || len(service.FormDataTemplate) > 0 {
-			formValues := make(map[string]string)
-
-			// Procesar datos de formulario estáticos
-			for key, value := range service.FormData {
-				formValues[key] = value
-			}
-
-			// Procesar plantillas de datos de formulario
-			for key, templateValue := range service.FormDataTemplate {
-				if containsTemplate(templateValue) {
-					// Crear funciones personalizadas para la plantilla
-					funcMap := template.FuncMap{
-						"uuid": func() string {
-							uuid := uuid.New().String()
-							r.Logger.Infof("Generando UUID para campo de formulario %s: %s", key, uuid)
-							return uuid
-						},
-					}
-
-					// Compilar la plantilla con las funciones personalizadas
-					tmpl, err := template.New("form_field").Funcs(funcMap).Parse(templateValue)
-					if err != nil {
-						return nil, fmt.Errorf("error al compilar la plantilla del campo de formulario %s: %w", key, err)
-					}
-
-					// Crear un buffer para la salida
-					buf := new(bytes.Buffer)
-
-					// Ejecutar la plantilla con los datos del contexto
-					data := make(map[string]interface{})
-
-					// Agregar los datos del contexto
-					for k, v := range ctx.Data {
-						data[k] = v
-					}
-
-					// Buscar primero en el almacén global de tokens
-					// Esto permite que todos los hilos compartan los tokens
-					for k, v := range r.GlobalTokens.Tokens {
-						data[k] = v
-					}
-
-					// Luego agregar los tokens del almacén local del hilo
-					// Esto permite que los tokens locales sobrescriban los globales
-					for k, v := range ctx.TokenStore.Tokens {
-						data[k] = v
-					}
-
-					if err := tmpl.Execute(buf, data); err != nil {
-						return nil, fmt.Errorf("error al ejecutar la plantilla del campo de formulario %s: %w", key, err)
-					}
-
-					formValues[key] = buf.String()
-				} else {
-					formValues[key] = templateValue
-				}
-			}
-
-			// Codificar los valores del formulario
-			formData := ""
-			i := 0
-			for key, value := range formValues {
-				if i > 0 {
-					formData += "&"
-				}
-				formData += key + "=" + strings.ReplaceAll(value, " ", "+")
-				i++
-			}
-
-			// Crear la solicitud con los datos del formulario
-			req, err = http.NewRequest(service.Method, url, strings.NewReader(formData))
+			// Ejecutar el servicio
+			result, err := r.executeService(ctx, service, threadVars, threadNum)
 			if err != nil {
-				return nil, fmt.Errorf("error al crear la solicitud form-urlencoded: %w", err)
-			}
+				// Comprobar si es un error de cancelación (fin de prueba)
+				if ctx.Err() != nil || strings.Contains(err.Error(), "cancelad") {
+					r.log.Debug(fmt.Sprintf("Hilo %d: Servicio %s cancelado (fin de prueba)", threadNum, service.Name))
+					return // Terminar el hilo completamente
+				} else {
+					r.log.Warn(fmt.Sprintf("Hilo %d: Error al ejecutar el servicio %s: %s", threadNum, service.Name, err.Error()))
 
-			// Asegurar que se establece la cabecera Content-Type correcta
-			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		}
-	} else {
-		// Manejar peticiones JSON (comportamiento original)
-		if service.Body != "" {
-			// Verificar si el cuerpo contiene plantillas
-			if containsTemplate(service.Body) {
-				// Crear funciones personalizadas para la plantilla
-				funcMap := template.FuncMap{
-					"uuid": func() string {
-						uuid := uuid.New().String()
-						r.Logger.Infof("Generando UUID para cuerpo: %s", uuid)
-						return uuid
-					},
+					// Registrar el error en las estadísticas
+					r.registerServiceResult(service.Name, 0, 0, err.Error(), threadNum)
 				}
+				continue
+			}
 
-				// Compilar la plantilla con las funciones personalizadas
-				tmpl, err := template.New("body").Funcs(funcMap).Parse(service.Body)
-				if err != nil {
-					return nil, fmt.Errorf("error al compilar la plantilla del cuerpo: %w", err)
+			// Registrar el resultado exitoso
+			r.registerServiceResult(service.Name, result.statusCode, result.responseTime, "", threadNum)
+
+			// Si el servicio extrajo variables, actualizar el mapa de variables del hilo
+			if result != nil && len(result.extractedVars) > 0 {
+				for k, v := range result.extractedVars {
+					threadVars[k] = v
+					r.log.Debug(fmt.Sprintf("Hilo %d: Variable extraída %s = %s", threadNum, k, v))
 				}
-
-				// Crear un buffer para la salida
-				buf := new(bytes.Buffer)
-
-				// Ejecutar la plantilla con los datos del contexto
-				data := make(map[string]interface{})
-
-				// Agregar los datos del contexto
-				for k, v := range ctx.Data {
-					data[k] = v
-				}
-
-				// Buscar primero en el almacén global de tokens
-				// Esto permite que todos los hilos compartan los tokens
-				for k, v := range r.GlobalTokens.Tokens {
-					data[k] = v
-				}
-
-				// Luego agregar los tokens del almacén local del hilo
-				// Esto permite que los tokens locales sobrescriban los globales
-				for k, v := range ctx.TokenStore.Tokens {
-					data[k] = v
-				}
-
-				if err := tmpl.Execute(buf, data); err != nil {
-					return nil, fmt.Errorf("error al ejecutar la plantilla del cuerpo: %w", err)
-				}
-
-				body = buf.Bytes()
-			} else {
-				// Si no contiene plantillas, usar el cuerpo tal cual
-				body = []byte(service.Body)
 			}
+
+			// Pausa breve entre servicios para simular pensamiento/procesamiento
+			// Varía según el número de hilo para evitar sincronización
+			pauseMs := 100 + (threadNum % 900)
+			time.Sleep(time.Duration(pauseMs) * time.Millisecond)
 		}
 
-		// Crear la solicitud
-		req, err = http.NewRequest(service.Method, url, bytes.NewBuffer(body))
-		if err != nil {
-			return nil, fmt.Errorf("error al crear la solicitud: %w", err)
+		r.log.Debug(fmt.Sprintf("Hilo %d: Completado ciclo %d/%d", threadNum, cycle+1, cycles))
+
+		// Pausa entre ciclos, variable según el número de hilo
+		if cycle < cycles-1 { // No esperar después del último ciclo
+			pauseMs := 200 + (threadNum % 800)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(pauseMs) * time.Millisecond):
+				// Continuar después de la pausa
+			}
 		}
 	}
 
-	// Agregar las cabeceras
-	for k, v := range service.Headers {
-		// Si la cabecera contiene una plantilla, procesarla
-		if containsTemplate(v) {
-			// Crear funciones personalizadas para la plantilla
-			funcMap := template.FuncMap{
-				"uuid": func() string {
-					uuid := uuid.New().String()
-					r.Logger.Infof("Generando UUID para cabecera %s: %s", k, uuid)
-					return uuid
-				},
-			}
-
-			// Compilar la plantilla con las funciones personalizadas
-			tmpl, err := template.New("header").Funcs(funcMap).Parse(v)
-			if err != nil {
-				return nil, fmt.Errorf("error al compilar la plantilla de la cabecera %s: %w", k, err)
-			}
-
-			// Crear un buffer para la salida
-			buf := new(bytes.Buffer)
-
-			// Ejecutar la plantilla con los datos del contexto
-			data := make(map[string]interface{})
-
-			// Agregar los datos del contexto
-			for k, v := range ctx.Data {
-				data[k] = v
-			}
-
-			// Buscar primero en el almacén global de tokens
-			// Esto permite que todos los hilos compartan los tokens
-			for k, v := range r.GlobalTokens.Tokens {
-				data[k] = v
-			}
-
-			// Luego agregar los tokens del almacén local del hilo
-			// Esto permite que los tokens locales sobrescriban los globales
-			for k, v := range ctx.TokenStore.Tokens {
-				data[k] = v
-			}
-
-			if err := tmpl.Execute(buf, data); err != nil {
-				return nil, fmt.Errorf("error al ejecutar la plantilla de la cabecera %s: %w", k, err)
-			}
-
-			req.Header.Set(k, buf.String())
-		} else {
-			req.Header.Set(k, v)
-		}
-	}
-
-	// Agregar el ID de correlación
-	req.Header.Set("X-Correlation-ID", ctx.CorrelationID)
-
-	// Ejecutar la solicitud
-	start := time.Now()
-
-	// Loguear la petición HTTP
-	r.Logger.Infof("Enviando petición %s %s", req.Method, req.URL.String())
-	r.Logger.Debugf("Headers: %v", req.Header)
-	if len(body) > 0 {
-		if len(body) > 1000 {
-			r.Logger.Debugf("Body: %s... (truncado)", string(body[:1000]))
-		} else {
-			r.Logger.Debugf("Body: %s", string(body))
-		}
-	}
-
-	resp, err := r.Client.Do(req)
-	responseTime := time.Since(start)
-
-	// Crear la respuesta
-	response := &models.Response{
-		RequestTime:   start,
-		ResponseTime:  responseTime,
-		ServiceName:   service.Name,
-		ThreadID:      ctx.ID,
-		CorrelationID: ctx.CorrelationID,
-	}
-
-	if err != nil {
-		response.Error = err
-		r.Logger.Warnf("Error en petición %s %s: %v", req.Method, req.URL.String(), err)
-		return response, nil
-	}
-
-	// Leer el cuerpo de la respuesta
-	defer resp.Body.Close()
-	response.Body, err = io.ReadAll(resp.Body)
-	if err != nil {
-		response.Error = fmt.Errorf("error al leer el cuerpo de la respuesta: %w", err)
-		r.Logger.Warnf("Error al leer respuesta: %v", err)
-		return response, nil
-	}
-
-	response.StatusCode = resp.StatusCode
-	response.Headers = resp.Header
-
-	// Loguear la respuesta HTTP en el logger principal
-	r.Logger.Infof("Respuesta %s %s: %d %s (%s)", req.Method, req.URL.String(),
-		resp.StatusCode, http.StatusText(resp.StatusCode), responseTime)
-	r.Logger.Debugf("Headers respuesta: %v", resp.Header)
-
-	// Registrar la respuesta completa en el logger de respuestas
-	if r.ResponseWriter != nil {
-		// Crear una representación de texto legible de la respuesta
-		var bodyContent string
-		if len(response.Body) > 0 {
-			// Intentar formatear el JSON para mejor legibilidad
-			var prettyJSON bytes.Buffer
-			if err := json.Indent(&prettyJSON, response.Body, "", "  "); err == nil {
-				bodyContent = prettyJSON.String()
-			} else {
-				// Si no es JSON válido, usar el string original
-				bodyContent = string(response.Body)
-			}
-		}
-
-		// Crear un log de texto legible con detalles completos
-		responseLog := fmt.Sprintf(
-			"===== RESPUESTA HTTP =====\n"+
-				"Timestamp: %s\n"+
-				"Servicio: %s\n"+
-				"Método: %s\n"+
-				"URL: %s\n"+
-				"Código de estado: %d (%s)\n"+
-				"Tiempo de respuesta: %s\n"+
-				"Hilo ID: %d\n"+
-				"ID de correlación: %s\n"+
-				"Cabeceras:\n%s\n"+
-				"Cuerpo:\n%s\n"+
-				"========================\n",
-			time.Now().Format(time.RFC3339),
-			service.Name,
-			req.Method,
-			req.URL.String(),
-			resp.StatusCode,
-			http.StatusText(resp.StatusCode),
-			responseTime.String(),
-			ctx.ID,
-			ctx.CorrelationID,
-			formatHeaders(resp.Header),
-			bodyContent,
-		)
-
-		// Enviar el log al canal asíncrono en lugar de escribir directamente
-		select {
-		case r.responseLogCh <- responseLog:
-			// Enviado exitosamente
-		default:
-			// Canal lleno, registrar advertencia pero no bloquear
-			r.Logger.Warn("Canal de logs de respuestas lleno, omitiendo una respuesta")
-		}
-	}
-
-	// Debug del body en el logger principal (versión resumida)
-	if len(response.Body) > 0 {
-		if len(response.Body) > 1000 {
-			r.Logger.Debugf("Body respuesta: %s... (truncado)", string(response.Body[:1000]))
-		} else {
-			r.Logger.Debugf("Body respuesta: %s", string(response.Body))
-		}
-	}
-
-	return response, nil
+	r.log.Debug(fmt.Sprintf("Hilo %d completado exitosamente después de %d ciclos", threadNum, cycles))
 }
 
-// collectResults recolecta los resultados de las pruebas
-func (r *Runner) collectResults(resultChan chan<- *models.TestResult) {
-	// Crear el resultado de la prueba
-	result := &models.TestResult{
-		StartTime:    r.StartTime,
-		ServiceStats: make(map[string]*models.ServiceStats),
-		Config:       r.Config,
-	}
-
-	// Recolectar los resultados
-	for resp := range r.Results {
-		// Incrementar el contador de solicitudes
-		result.TotalRequests++
-
-		// Verificar si es una solicitud exitosa
-		if resp.Error == nil && resp.StatusCode >= 200 && resp.StatusCode < 400 {
-			result.SuccessRequests++
-		} else {
-			result.FailedRequests++
-		}
-
-		// Obtener o crear las estadísticas del servicio
-		stats, ok := result.ServiceStats[resp.ServiceName]
-		if !ok {
-			stats = &models.ServiceStats{
-				ServiceName:     resp.ServiceName,
-				StatusCodes:     make(map[int]int),
-				Errors:          make(map[string]int),
-				StartTime:       resp.RequestTime,
-				MinResponseTime: resp.ResponseTime,
-				MaxResponseTime: resp.ResponseTime,
-			}
-			result.ServiceStats[resp.ServiceName] = stats
-		}
-
-		// Actualizar las estadísticas
-		stats.TotalRequests++
-
-		if resp.Error == nil && resp.StatusCode >= 200 && resp.StatusCode < 400 {
-			stats.SuccessRequests++
-		} else {
-			stats.FailedRequests++
-		}
-
-		// Actualizar los tiempos de respuesta
-		if resp.ResponseTime < stats.MinResponseTime {
-			stats.MinResponseTime = resp.ResponseTime
-		}
-		if resp.ResponseTime > stats.MaxResponseTime {
-			stats.MaxResponseTime = resp.ResponseTime
-		}
-
-		// Actualizar los códigos de estado
-		if resp.StatusCode > 0 {
-			stats.StatusCodes[resp.StatusCode]++
-		}
-
-		// Actualizar los errores
-		if resp.Error != nil {
-			stats.Errors[resp.Error.Error()]++
-		}
-
-		// Actualizar el tiempo de fin
-		if resp.RequestTime.After(stats.EndTime) {
-			stats.EndTime = resp.RequestTime
-		}
-	}
-
-	// Calcular las estadísticas por servicio
-	for _, stats := range result.ServiceStats {
-		// Calcular el tiempo promedio de respuesta
-		if stats.TotalRequests > 0 {
-			stats.AvgResponseTime = (stats.MinResponseTime + stats.MaxResponseTime) / 2
-		}
-
-		// Calcular las solicitudes por segundo
-		duration := stats.EndTime.Sub(stats.StartTime)
-		if duration > 0 {
-			stats.RequestsPerSecond = float64(stats.TotalRequests) / duration.Seconds()
-		}
-	}
-
-	// Establecer la fecha de fin del resultado
-	result.EndTime = time.Now()
-
-	// Enviar el resultado
-	resultChan <- result
-	close(resultChan)
+// Estructura para almacenar el resultado de la ejecución de un servicio
+type serviceResult struct {
+	statusCode    int
+	responseTime  time.Duration
+	extractedVars map[string]string
 }
 
-// generateReport genera un reporte de las pruebas
-func (r *Runner) generateReport(result *models.TestResult) error {
-	// Crear el directorio de reportes si no existe
-	if err := os.MkdirAll(r.Config.ReportDir, 0755); err != nil {
-		return fmt.Errorf("error al crear el directorio de reportes: %w", err)
-	}
-
-	// Generar el nombre del reporte
-	reportName := fmt.Sprintf("report_%s.md", time.Now().Format("20060102_150405"))
-	reportPath := fmt.Sprintf("%s/%s", r.Config.ReportDir, reportName)
-
-	// Crear el archivo de reporte
-	file, err := os.Create(reportPath)
-	if err != nil {
-		return fmt.Errorf("error al crear el archivo de reporte: %w", err)
-	}
-	defer file.Close()
-
-	// Escribir el encabezado del reporte
-	fmt.Fprintf(file, "# Reporte de Pruebas de Stress\n\n")
-	fmt.Fprintf(file, "## Resumen\n\n")
-	fmt.Fprintf(file, "- **Fecha de inicio:** %s\n", result.StartTime.Format("2006-01-02 15:04:05"))
-	fmt.Fprintf(file, "- **Fecha de fin:** %s\n", result.EndTime.Format("2006-01-02 15:04:05"))
-	fmt.Fprintf(file, "- **Duración:** %s\n", reporter.FormatDuration(result.EndTime.Sub(result.StartTime)))
-	fmt.Fprintf(file, "- **Total de solicitudes:** %d\n", result.TotalRequests)
-	fmt.Fprintf(file, "- **Solicitudes exitosas:** %d (%.2f%%)\n", result.SuccessRequests, float64(result.SuccessRequests)/float64(result.TotalRequests)*100)
-	fmt.Fprintf(file, "- **Solicitudes fallidas:** %d (%.2f%%)\n", result.FailedRequests, float64(result.FailedRequests)/float64(result.TotalRequests)*100)
-
-	// Generar y añadir el gráfico de resumen de solicitudes
-	svgChart := generateRequestsSummaryChart(result)
-	fmt.Fprintf(file, "\n## Gráfico de Solicitudes\n\n")
-	fmt.Fprintf(file, "%s\n", svgChart)
-
-	// Escribir las estadísticas por servicio
-	fmt.Fprintf(file, "\n## Estadísticas por Servicio\n\n")
-
-	for _, stats := range result.ServiceStats {
-		fmt.Fprintf(file, "### %s\n\n", stats.ServiceName)
-		fmt.Fprintf(file, "- **Total de solicitudes:** %d\n", stats.TotalRequests)
-		fmt.Fprintf(file, "- **Solicitudes exitosas:** %d (%.2f%%)\n", stats.SuccessRequests, float64(stats.SuccessRequests)/float64(stats.TotalRequests)*100)
-		fmt.Fprintf(file, "- **Solicitudes fallidas:** %d (%.2f%%)\n", stats.FailedRequests, float64(stats.FailedRequests)/float64(stats.TotalRequests)*100)
-		fmt.Fprintf(file, "- **Tiempo mínimo de respuesta:** %s\n", reporter.FormatDuration(stats.MinResponseTime))
-		fmt.Fprintf(file, "- **Tiempo máximo de respuesta:** %s\n", reporter.FormatDuration(stats.MaxResponseTime))
-		fmt.Fprintf(file, "- **Tiempo promedio de respuesta:** %s\n", reporter.FormatDuration(stats.AvgResponseTime))
-		fmt.Fprintf(file, "- **Solicitudes por segundo:** %.2f\n", stats.RequestsPerSecond)
-
-		// Generar y añadir el gráfico de tiempos de respuesta para este servicio
-		responseTimeChart := generateResponseTimeChart(stats)
-		fmt.Fprintf(file, "\n#### Gráfico de Tiempos de Respuesta\n\n")
-		fmt.Fprintf(file, "%s\n", responseTimeChart)
-
-		// Escribir los códigos de estado
-		fmt.Fprintf(file, "\n#### Códigos de Estado\n\n")
-		for code, count := range stats.StatusCodes {
-			fmt.Fprintf(file, "- **%d:** %d (%.2f%%)\n", code, count, float64(count)/float64(stats.TotalRequests)*100)
-		}
-
-		// Generar y añadir el gráfico de códigos de estado
-		statusCodeChart := generateStatusCodeChart(stats)
-		fmt.Fprintf(file, "\n#### Gráfico de Códigos de Estado\n\n")
-		fmt.Fprintf(file, "%s\n", statusCodeChart)
-
-		// Escribir los errores
-		if len(stats.Errors) > 0 {
-			fmt.Fprintf(file, "\n#### Errores\n\n")
-			for err, count := range stats.Errors {
-				fmt.Fprintf(file, "- **%s:** %d (%.2f%%)\n", err, count, float64(count)/float64(stats.TotalRequests)*100)
-			}
-		}
-	}
-
-	// Escribir la configuración
-	fmt.Fprintf(file, "\n## Configuración\n\n")
-	fmt.Fprintf(file, "```yaml\n")
-
-	// Usar la configuración original si está disponible
-	if cfg, ok := result.Config.(*config.Config); ok && cfg.OriginalConfig != "" {
-		// Escribir la configuración original (con referencias a variables de entorno)
-		fmt.Fprintf(file, "%s\n", cfg.OriginalConfig)
-	} else {
-		// Intentar leer el archivo gmeter.yaml
-		configPath := "gmeter.yaml"
-		if fileExists(configPath) {
-			// Leer el contenido del archivo de configuración
-			configContent, err := os.ReadFile(configPath)
-			if err == nil {
-				// Escribir el contenido original del archivo YAML
-				fmt.Fprintf(file, "%s\n", string(configContent))
-			} else {
-				// Si hay un error al leer el archivo, usar la versión JSON
-				writeJSONConfig(file, r.Config)
-			}
-		} else {
-			// Si no se encuentra el archivo, usar la versión JSON
-			writeJSONConfig(file, r.Config)
-		}
-	}
-
-	fmt.Fprintf(file, "```\n")
-
-	r.Logger.Infof("Reporte generado: %s", reportPath)
-	return nil
-}
-
-// fileExists verifica si un archivo existe
-func fileExists(filename string) bool {
-	_, err := os.Stat(filename)
-	return err == nil
-}
-
-// writeJSONConfig escribe la configuración en formato JSON (método anterior)
-func writeJSONConfig(file *os.File, cfg *config.Config) {
-	// Simplificar la configuración para el reporte
-	simplifiedConfig := map[string]interface{}{
-		"global":   cfg.GlobalConfig,
-		"services": cfg.Services,
-	}
-
-	// Convertir la configuración simplificada a JSON
-	simplifiedJSON, err := json.MarshalIndent(simplifiedConfig, "", "  ")
-	if err != nil {
-		fmt.Fprintf(file, "Error al convertir la configuración a JSON: %v\n", err)
+// logResponse registra la respuesta HTTP en el archivo de log
+func (r *Runner) logResponse(threadNum int, service *config.Service, req *http.Request, resp *http.Response, responseBody []byte, responseTime time.Duration, extractedVars map[string]string) {
+	// Si no hay un logger de respuestas configurado, no hacer nada
+	if r.responseLog == nil {
 		return
 	}
 
-	fmt.Fprintf(file, "%s\n", simplifiedJSON)
+	// Crear un resumen de la respuesta para el log
+	logEntry := map[string]interface{}{
+		"timestamp":     time.Now().Format(time.RFC3339),
+		"thread_id":     threadNum,
+		"service":       service.Name,
+		"method":        req.Method,
+		"url":           req.URL.String(),
+		"status_code":   resp.StatusCode,
+		"response_time": responseTime.Milliseconds(),
+		"headers":       resp.Header,
+	}
+
+	// Limitar el tamaño del cuerpo para evitar logs demasiado grandes
+	maxBodySize := 4096 // 4KB máximo
+	responseBodyStr := string(responseBody)
+	if len(responseBodyStr) > maxBodySize {
+		responseBodyStr = responseBodyStr[:maxBodySize] + "... [truncado]"
+	}
+	logEntry["body"] = responseBodyStr
+
+	// Añadir variables extraídas si hay alguna
+	if len(extractedVars) > 0 {
+		logEntry["extracted_vars"] = extractedVars
+	}
+
+	// Registrar la respuesta en formato JSON
+	r.responseLog.WithFields(logEntry).Info(fmt.Sprintf("Respuesta HTTP para hilo %d, servicio %s: %d", threadNum, service.Name, resp.StatusCode))
 }
 
-// generateRequestsSummaryChart genera un gráfico SVG con el resumen de solicitudes
-func generateRequestsSummaryChart(result *models.TestResult) string {
-	// Definir dimensiones y colores
-	width := 600
-	height := 400
-	barWidth := 40
-	spacing := 60
-
-	// Calcular la posición inicial de las barras
-	startX := 100
-
-	// Crear el SVG
-	svg := fmt.Sprintf(`<svg width="%d" height="%d" xmlns="http://www.w3.org/2000/svg">`, width, height)
-
-	// Añadir título
-	svg += fmt.Sprintf(`<text x="%d" y="30" font-family="Arial" font-size="16" text-anchor="middle" font-weight="bold">Resumen de Solicitudes</text>`, width/2)
-
-	// Dibujar ejes
-	svg += fmt.Sprintf(`<line x1="50" y1="%d" x2="%d" y1="%d" y2="%d" stroke="black" stroke-width="2"/>`, height-50, width-50, height-50, height-50) // Eje X
-	svg += fmt.Sprintf(`<line x1="50" y1="50" x2="50" y1="%d" y2="%d" stroke="black" stroke-width="2"/>`, height-50, height-50)                      // Eje Y
-
-	// Calcular la escala para el eje Y
-	maxValue := float64(result.TotalRequests)
-	if maxValue == 0 {
-		maxValue = 1 // Evitar división por cero
+// executeService ejecuta un servicio HTTP y devuelve el resultado
+func (r *Runner) executeService(ctx context.Context, service *config.Service, vars map[string]string, threadNum int) (*serviceResult, error) {
+	// Verificar si el contexto ya fue cancelado antes de empezar
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("petición cancelada (fin de prueba)")
 	}
 
-	// Dibujar barras para cada servicio
-	x := startX
+	// Loguear inicio de ejecución del servicio
+	r.log.Debug(fmt.Sprintf("Hilo %d: Iniciando ejecución del servicio %s", threadNum, service.Name))
 
-	// Ordenar los servicios por nombre para consistencia
-	var serviceNames []string
-	for name := range result.ServiceStats {
-		serviceNames = append(serviceNames, name)
-	}
-	sort.Strings(serviceNames)
+	startTime := time.Now()
 
-	for _, name := range serviceNames {
-		stats := result.ServiceStats[name]
+	// Preparar la URL con las variables
+	urlStr := r.replaceVariables(service.URL, vars)
 
-		// Calcular altura de la barra (proporcional al número de solicitudes)
-		barHeight := int(float64(stats.TotalRequests) / maxValue * 300)
-
-		// Dibujar la barra
-		svg += fmt.Sprintf(`<rect x="%d" y="%d" width="%d" height="%d" fill="#4285F4"/>`,
-			x, height-50-barHeight, barWidth, barHeight)
-
-		// Añadir etiqueta con el número de solicitudes
-		svg += fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="12" text-anchor="middle">%d</text>`,
-			x+barWidth/2, height-55-barHeight, stats.TotalRequests)
-
-		// Añadir etiqueta con el nombre del servicio
-		svg += fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="12" text-anchor="middle" transform="rotate(-45, %d, %d)">%s</text>`,
-			x+barWidth/2, height-35, x+barWidth/2, height-35, name)
-
-		// Avanzar a la siguiente posición
-		x += spacing + barWidth
+	// Crear la solicitud HTTP
+	method := strings.ToUpper(service.Method)
+	if method == "" {
+		method = "GET"
 	}
 
-	// Cerrar el SVG
-	svg += `</svg>`
+	var reqBody io.Reader
 
-	return svg
-}
-
-// generateResponseTimeChart genera un gráfico SVG con los tiempos de respuesta
-func generateResponseTimeChart(stats *models.ServiceStats) string {
-	// Definir dimensiones y colores
-	width := 600
-	height := 300
-
-	// Crear el SVG
-	svg := fmt.Sprintf(`<svg width="%d" height="%d" xmlns="http://www.w3.org/2000/svg">`, width, height)
-
-	// Añadir título
-	svg += fmt.Sprintf(`<text x="%d" y="30" font-family="Arial" font-size="14" text-anchor="middle" font-weight="bold">Tiempos de Respuesta - %s</text>`, width/2, stats.ServiceName)
-
-	// Dibujar ejes
-	svg += fmt.Sprintf(`<line x1="50" y1="%d" x2="%d" y1="%d" y2="%d" stroke="black" stroke-width="2"/>`, height-50, width-50, height-50, height-50) // Eje X
-	svg += fmt.Sprintf(`<line x1="50" y1="50" x2="50" y1="%d" y2="%d" stroke="black" stroke-width="2"/>`, height-50, height-50)                      // Eje Y
-
-	// Etiquetas de los ejes
-	svg += `<text x="50" y="40" font-family="Arial" font-size="12" text-anchor="middle">ms</text>`
-	svg += `<text x="300" y="280" font-family="Arial" font-size="12" text-anchor="middle">Tipo</text>`
-
-	// Dibujar barras para min, avg, max
-	barWidth := 80
-	spacing := 50
-
-	// Convertir durations a milisegundos para mejor visualización
-	minMs := float64(stats.MinResponseTime.Microseconds()) / 1000.0
-	avgMs := float64(stats.AvgResponseTime.Microseconds()) / 1000.0
-	maxMs := float64(stats.MaxResponseTime.Microseconds()) / 1000.0
-
-	// Encontrar el valor máximo para escalar
-	maxValue := maxMs
-	if maxValue == 0 {
-		maxValue = 1 // Evitar división por cero
+	// Manejar diferentes tipos de contenido
+	contentType := service.ContentType
+	if contentType == "" {
+		contentType = "json" // Por defecto
 	}
 
-	// Calcular alturas de las barras
-	minHeight := int(minMs / maxValue * 200)
-	avgHeight := int(avgMs / maxValue * 200)
-	maxHeight := int(maxMs / maxValue * 200)
+	switch contentType {
+	case "form":
+		// Preparar datos de formulario
+		form := url.Values{}
 
-	// Dibujar las barras
-	x := 100
-
-	// Barra de mínimo
-	svg += fmt.Sprintf(`<rect x="%d" y="%d" width="%d" height="%d" fill="#34A853"/>`,
-		x, height-50-minHeight, barWidth, minHeight)
-	svg += fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="12" text-anchor="middle">%.2f ms</text>`,
-		x+barWidth/2, height-55-minHeight, minMs)
-	svg += fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="12" text-anchor="middle">Mínimo</text>`,
-		x+barWidth/2, height-30)
-
-	// Barra de promedio
-	x += barWidth + spacing
-	svg += fmt.Sprintf(`<rect x="%d" y="%d" width="%d" height="%d" fill="#FBBC05"/>`,
-		x, height-50-avgHeight, barWidth, avgHeight)
-	svg += fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="12" text-anchor="middle">%.2f ms</text>`,
-		x+barWidth/2, height-55-avgHeight, avgMs)
-	svg += fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="12" text-anchor="middle">Promedio</text>`,
-		x+barWidth/2, height-30)
-
-	// Barra de máximo
-	x += barWidth + spacing
-	svg += fmt.Sprintf(`<rect x="%d" y="%d" width="%d" height="%d" fill="#EA4335"/>`,
-		x, height-50-maxHeight, barWidth, maxHeight)
-	svg += fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="12" text-anchor="middle">%.2f ms</text>`,
-		x+barWidth/2, height-55-maxHeight, maxMs)
-	svg += fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="12" text-anchor="middle">Máximo</text>`,
-		x+barWidth/2, height-30)
-
-	// Cerrar el SVG
-	svg += `</svg>`
-
-	return svg
-}
-
-// generateStatusCodeChart genera un gráfico SVG con los códigos de estado
-func generateStatusCodeChart(stats *models.ServiceStats) string {
-	// Si no hay códigos de estado, devolver un mensaje
-	if len(stats.StatusCodes) == 0 {
-		return "<p>No hay datos de códigos de estado disponibles.</p>"
-	}
-
-	// Definir dimensiones
-	width := 400
-	height := 400
-	centerX := width / 2
-	centerY := height / 2
-	radius := float64(150) // Convertir a float64 para operaciones matemáticas
-
-	// Crear el SVG
-	svg := fmt.Sprintf(`<svg width="%d" height="%d" xmlns="http://www.w3.org/2000/svg">`, width, height)
-
-	// Añadir título
-	svg += fmt.Sprintf(`<text x="%d" y="30" font-family="Arial" font-size="14" text-anchor="middle" font-weight="bold">Códigos de Estado - %s</text>`, width/2, stats.ServiceName)
-
-	// Colores para el gráfico de pastel
-	colors := []string{"#4285F4", "#34A853", "#FBBC05", "#EA4335", "#5F6368", "#185ABC", "#137333", "#EA8600", "#B31412", "#3C4043"}
-
-	// Calcular el total de solicitudes para los porcentajes
-	total := 0
-	for _, count := range stats.StatusCodes {
-		total += count
-	}
-
-	// Ordenar los códigos para consistencia
-	var codes []int
-	for code := range stats.StatusCodes {
-		codes = append(codes, code)
-	}
-	sort.Ints(codes)
-
-	// Dibujar el gráfico de pastel
-	startAngle := 0.0
-	legendY := 50
-
-	for i, code := range codes {
-		count := stats.StatusCodes[code]
-		percentage := float64(count) / float64(total)
-		endAngle := startAngle + percentage*360.0
-
-		// Convertir ángulos a radianes
-		startRad := startAngle * math.Pi / 180.0
-		endRad := endAngle * math.Pi / 180.0
-
-		// Determinar si el arco es mayor a 180 grados
-		largeArcFlag := 0
-		if endAngle-startAngle > 180 {
-			largeArcFlag = 1
+		// Procesar los datos del formulario
+		for key, value := range service.FormData {
+			form.Add(key, r.replaceVariables(value, vars))
 		}
 
-		// Calcular puntos del arco
-		x1 := float64(centerX) + radius*math.Sin(startRad)
-		y1 := float64(centerY) - radius*math.Cos(startRad)
-		x2 := float64(centerX) + radius*math.Sin(endRad)
-		y2 := float64(centerY) - radius*math.Cos(endRad)
-
-		// Dibujar el sector
-		color := colors[i%len(colors)]
-		pathData := fmt.Sprintf("M%d,%d L%.1f,%.1f A%.1f,%.1f 0 %d 1 %.1f,%.1f Z",
-			centerX, centerY, x1, y1, radius, radius, largeArcFlag, x2, y2)
-
-		svg += fmt.Sprintf(`<path d="%s" fill="%s" stroke="white" stroke-width="1"/>`, pathData, color)
-
-		// Añadir etiqueta en el centro del sector
-		labelAngle := (startAngle + endAngle) / 2
-		labelRad := labelAngle * math.Pi / 180.0
-		labelDistance := radius * 0.7 // Usar directamente el valor float64
-		labelX := float64(centerX) + labelDistance*math.Sin(labelRad)
-		labelY := float64(centerY) - labelDistance*math.Cos(labelRad)
-
-		if percentage > 0.05 { // Solo mostrar etiqueta si el sector es suficientemente grande
-			svg += fmt.Sprintf(`<text x="%.1f" y="%.1f" font-family="Arial" font-size="12" text-anchor="middle" fill="white">%d%%</text>`,
-				labelX, labelY, int(percentage*100))
+		// Procesar los datos del formulario basados en plantillas
+		for key, tpl := range service.FormDataTemplate {
+			form.Add(key, r.replaceVariables(tpl, vars))
 		}
 
-		// Añadir leyenda
-		svg += fmt.Sprintf(`<rect x="%d" y="%d" width="15" height="15" fill="%s"/>`, width-100, legendY, color)
-		svg += fmt.Sprintf(`<text x="%d" y="%d" font-family="Arial" font-size="12">%d (%d)</text>`,
-			width-80, legendY+12, code, count)
-
-		legendY += 25
-		startAngle = endAngle
-	}
-
-	// Cerrar el SVG
-	svg += `</svg>`
-
-	return svg
-}
-
-// containsTemplate verifica si una cadena contiene una plantilla
-func containsTemplate(s string) bool {
-	// Verificar si la cadena contiene "{{" y "}}" para ser considerada una plantilla
-	return strings.Contains(s, "{{") && strings.Contains(s, "}}")
-}
-
-// formatHeaders formatea las cabeceras de la respuesta HTTP para una mejor legibilidad
-func formatHeaders(headers http.Header) string {
-	var formattedHeaders string
-	for name, values := range headers {
-		for _, value := range values {
-			formattedHeaders += fmt.Sprintf("%s: %s\n", name, value)
+		reqBody = strings.NewReader(form.Encode())
+	default:
+		// JSON u otro tipo de contenido (texto plano)
+		if service.Body != "" {
+			reqBody = strings.NewReader(r.replaceVariables(service.Body, vars))
 		}
 	}
-	return formattedHeaders
+
+	// Crear la solicitud HTTP con un timeout específico
+	req, err := http.NewRequestWithContext(ctx, method, urlStr, reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("error al crear la solicitud: %w", err)
+	}
+
+	// Agregar encabezados
+	for key, value := range service.Headers {
+		req.Header.Set(key, r.replaceVariables(value, vars))
+	}
+
+	// Establecer el tipo de contenido predeterminado para POST/PUT
+	if (method == "POST" || method == "PUT") && req.Header.Get("Content-Type") == "" {
+		if contentType == "form" {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		} else {
+			req.Header.Set("Content-Type", "application/json")
+		}
+	}
+
+	// Usar un cliente con un timeout razonable para esta petición específica
+	// para evitar que las peticiones se queden colgadas
+	clientTimeout := 30 * time.Second
+	client := &http.Client{
+		Timeout:   clientTimeout,
+		Transport: r.client.Transport,
+	}
+
+	// Ejecutar la solicitud HTTP
+	resp, err := client.Do(req)
+
+	// Si el error está relacionado con un contexto cancelado, manejarlo de forma más amigable
+	if err != nil {
+		if ctx.Err() != nil {
+			// El contexto fue cancelado, lo cual es esperado al finalizar la prueba
+			return nil, fmt.Errorf("petición cancelada (fin de prueba)")
+		}
+		return nil, fmt.Errorf("error al ejecutar la solicitud: %w", err)
+	}
+
+	defer resp.Body.Close()
+
+	// Calcular el tiempo de respuesta
+	responseTime := time.Since(startTime)
+
+	// Leer el cuerpo de la respuesta
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error al leer la respuesta: %w", err)
+	}
+
+	// Registrar la respuesta
+	r.log.Debug(fmt.Sprintf("Hilo %d: Servicio %s respondió con código %d en %v",
+		threadNum, service.Name, resp.StatusCode, responseTime))
+
+	// Extraer variables de la respuesta si es necesario
+	extractedVars := make(map[string]string)
+
+	// Por ahora solo extraemos el token si está configurado
+	if service.ExtractToken != "" && service.TokenName != "" {
+		rule := service.ExtractToken
+		varName := service.TokenName
+
+		// En las pruebas, la regla es simplemente "token" y el cuerpo de respuesta es JSON:
+		// {"message": "Hello, World!", "token": "test_token"}
+		// Vamos a extraer el valor directamente del JSON
+		bodyStr := string(responseBody)
+		r.log.Debug(fmt.Sprintf("Hilo %d: Intentando extraer token. Respuesta: %s", threadNum, bodyStr))
+
+		// Extraer value del JSON usando una regex simple
+		jsonPattern := fmt.Sprintf(`"%s"\s*:\s*"([^"]+)"`, rule)
+		pattern := regexp.MustCompile(jsonPattern)
+		matches := pattern.FindStringSubmatch(bodyStr)
+
+		if len(matches) > 1 {
+			// El primer grupo capturado es el valor que queremos extraer
+			extractedVars[varName] = matches[1]
+			r.log.Debug(fmt.Sprintf("Hilo %d: Token extraído para %s: %s", threadNum, varName, matches[1]))
+		} else {
+			// Si no funciona con la regex sencilla, intentar con otras técnicas
+			r.log.Debug(fmt.Sprintf("Hilo %d: No se pudo extraer el token usando regex sencilla. Probando otras técnicas", threadNum))
+
+			// Intentar con la regex original proporcionada
+			originalPattern := regexp.MustCompile(rule)
+			origMatches := originalPattern.FindStringSubmatch(bodyStr)
+
+			if len(origMatches) > 1 {
+				extractedVars[varName] = origMatches[1]
+				r.log.Debug(fmt.Sprintf("Hilo %d: Token extraído con regex original para %s: %s", threadNum, varName, origMatches[1]))
+			} else {
+				r.log.Debug(fmt.Sprintf("Hilo %d: No se pudo extraer el token usando ninguna técnica. Respuesta: %s, Regla: %s",
+					threadNum, bodyStr, rule))
+			}
+		}
+	}
+
+	// Registrar la respuesta en el archivo de log si está configurado
+	r.logResponse(threadNum, service, req, resp, responseBody, responseTime, extractedVars)
+
+	return &serviceResult{
+		statusCode:    resp.StatusCode,
+		responseTime:  responseTime,
+		extractedVars: extractedVars,
+	}, nil
+}
+
+// registerServiceResult registra el resultado de un servicio para su inclusión en el reporte
+func (r *Runner) registerServiceResult(serviceName string, statusCode int, responseTime time.Duration, errStr string, threadNum int) {
+	r.statsMutex.Lock()
+	defer r.statsMutex.Unlock()
+
+	// Incrementar contadores globales
+	r.testResult.TotalRequests++
+	if errStr == "" && statusCode >= 200 && statusCode < 400 {
+		r.testResult.SuccessRequests++
+		// Log de éxito detallado
+		r.log.Debug(fmt.Sprintf("Hilo %d: Servicio %s completado con éxito - Código: %d, Tiempo: %v",
+			threadNum, serviceName, statusCode, responseTime))
+	} else {
+		r.testResult.FailedRequests++
+		// Log de error detallado
+		if errStr != "" {
+			r.log.Warn(fmt.Sprintf("Hilo %d: Servicio %s falló - Error: %s",
+				threadNum, serviceName, errStr))
+		} else {
+			r.log.Warn(fmt.Sprintf("Hilo %d: Servicio %s falló - Código: %d, Tiempo: %v",
+				threadNum, serviceName, statusCode, responseTime))
+		}
+	}
+
+	// Actualizar el resumen de códigos de estado
+	if statusCode > 0 {
+		r.testResult.StatusCodeSummary[statusCode]++
+	}
+
+	// Obtener o crear las estadísticas del servicio
+	stats, ok := r.testResult.ServiceStats[serviceName]
+	if !ok {
+		stats = &models.ServiceStats{
+			ServiceName: serviceName,
+			StartTime:   time.Now(),
+			StatusCodes: make(map[int]int),
+			Errors:      make(map[string]int),
+		}
+		r.testResult.ServiceStats[serviceName] = stats
+	}
+
+	// Actualizar estadísticas del servicio
+	stats.TotalRequests++
+	stats.EndTime = time.Now()
+
+	if errStr == "" && statusCode >= 200 && statusCode < 400 {
+		stats.SuccessRequests++
+	} else {
+		stats.FailedRequests++
+	}
+
+	// Registrar el código de estado
+	if statusCode > 0 {
+		stats.StatusCodes[statusCode]++
+	}
+
+	// Registrar el error si hubo
+	if errStr != "" {
+		stats.Errors[errStr]++
+	}
+
+	// Actualizar tiempos de respuesta
+	if responseTime > 0 {
+		if stats.TotalRequests == 1 || responseTime < stats.MinResponseTime {
+			stats.MinResponseTime = responseTime
+		}
+		if responseTime > stats.MaxResponseTime {
+			stats.MaxResponseTime = responseTime
+		}
+
+		// Cálculo acumulativo del promedio
+		stats.AvgResponseTime = stats.AvgResponseTime + (responseTime-stats.AvgResponseTime)/time.Duration(stats.TotalRequests)
+	}
+
+	// Actualizar solicitudes por segundo
+	timeElapsed := stats.EndTime.Sub(stats.StartTime).Seconds()
+	if timeElapsed > 0 {
+		stats.RequestsPerSecond = float64(stats.TotalRequests) / timeElapsed
+	}
+}
+
+// replaceVariables reemplaza las variables en un string con sus valores correspondientes
+func (r *Runner) replaceVariables(input string, vars map[string]string) string {
+	result := input
+
+	// Patrón para detectar referencias a variables: {{variable}}
+	pattern := regexp.MustCompile(`\{\{([^{}]+)\}\}`)
+
+	return pattern.ReplaceAllStringFunc(result, func(match string) string {
+		// Extraer el nombre de la variable (quitar {{ y }})
+		varName := strings.TrimSpace(match[2 : len(match)-2])
+
+		// Buscar el valor de la variable
+		if value, ok := vars[varName]; ok {
+			return value
+		}
+
+		// Si no se encuentra, devolver la referencia original
+		return match
+	})
+}
+
+// cloneVariables crea una copia del mapa de variables compartidas
+func (r *Runner) cloneVariables() map[string]string {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	clone := make(map[string]string, len(r.variables))
+	for k, v := range r.variables {
+		clone[k] = v
+	}
+	return clone
 }
