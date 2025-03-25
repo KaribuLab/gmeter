@@ -113,7 +113,7 @@ func (g *SVGChartGenerator) GenerateTimeSeriesChart(title string, data map[strin
 	i := 0
 	for name, values := range data {
 		// Dibujar la línea
-		buf.WriteString(fmt.Sprintf(`<polyline points="`))
+		buf.WriteString(`<polyline points="`)
 
 		for j, v := range values {
 			x := g.Margin + j*xStep
@@ -180,7 +180,7 @@ func generateThreadActivityChart(result *models.TestResult, g *SVGChartGenerator
 }
 
 // GenerateReport genera un reporte de las pruebas
-func GenerateReport(result *models.TestResult, reportDir string) (string, error) {
+func GenerateReport(result *models.TestResult, reportDir string, reportName string) (string, error) {
 	// Calcular estadísticas adicionales
 	result.CalculateAdditionalStats()
 	effectiveRPS := result.GetEffectiveRequestsPerSecond()
@@ -214,8 +214,14 @@ func GenerateReport(result *models.TestResult, reportDir string) (string, error)
 		threadActivityChartSVG = ""
 	}
 
-	// Generar el nombre del reporte
-	reportName := fmt.Sprintf("report_%s.md", time.Now().Format("20060102_150405"))
+	// Generar el nombre del reporte si no se proporcionó uno
+	if reportName == "" {
+		reportName = fmt.Sprintf("report_%s.md", time.Now().Format("20060102_150405"))
+	} else if !strings.HasSuffix(reportName, ".md") {
+		// Asegurar que el nombre del reporte termine en .md
+		reportName = reportName + ".md"
+	}
+
 	reportPath := filepath.Join(reportDir, reportName)
 
 	// Crear el archivo de reporte
@@ -236,38 +242,22 @@ func GenerateReport(result *models.TestResult, reportDir string) (string, error)
 	fmt.Fprintf(file, "- **Promedio de hilos activos:** %.2f\n", result.AvgActiveThreads)
 	fmt.Fprintf(file, "- **Solicitudes por segundo (efectivo):** %.2f\n", effectiveRPS)
 
+	// Calcular y mostrar el pico de solicitudes por segundo
+	var peakRPS float64
+	for _, activity := range result.ThreadActivity {
+		if activity.RequestsPS > peakRPS {
+			peakRPS = activity.RequestsPS
+		}
+	}
+	fmt.Fprintf(file, "- **Peak de solicitudes por segundo:** %.2f\n", peakRPS)
+
 	if result.TotalRequests > 0 {
 		fmt.Fprintf(file, "- **Solicitudes exitosas:** %d (%.2f%%)\n", result.SuccessRequests, float64(result.SuccessRequests)/float64(result.TotalRequests)*100)
 		fmt.Fprintf(file, "- **Solicitudes fallidas:** %d (%.2f%%)\n", result.FailedRequests, float64(result.FailedRequests)/float64(result.TotalRequests)*100)
 	}
 
-	// Añadir métricas de concurrencia
-	if len(result.ThreadActivity) > 0 {
-		// Calcular las tasas de solicitudes máximas y promedio
-		var maxRPS, totalRPS float64
-		var validRPSSamples int
-
-		for _, activity := range result.ThreadActivity {
-			if activity.RequestsPS > maxRPS {
-				maxRPS = activity.RequestsPS
-			}
-
-			if activity.RequestsPS > 0 {
-				totalRPS += activity.RequestsPS
-				validRPSSamples++
-			}
-		}
-
-		avgRPS := 0.0
-		if validRPSSamples > 0 {
-			avgRPS = totalRPS / float64(validRPSSamples)
-		}
-
-		fmt.Fprintf(file, "\n### Métricas de Concurrencia\n\n")
-		fmt.Fprintf(file, "- **Pico de solicitudes por segundo:** %.2f\n", maxRPS)
-		fmt.Fprintf(file, "- **Promedio de solicitudes por segundo:** %.2f\n", avgRPS)
-		fmt.Fprintf(file, "- **Relación solicitudes/hilos activos:** %.2f\n", avgRPS/math.Max(1, result.AvgActiveThreads))
-	}
+	// Agregar nota explicativa sobre las solicitudes efectivas
+	fmt.Fprintf(file, "\n> NOTA: Las solicitudes efectivas son el total de solicitudes dividido por la duración total de la prueba\n")
 
 	// Mostrar resumen de códigos de estado HTTP
 	fmt.Fprintf(file, "\n### Resumen de Códigos de Estado HTTP\n\n")
@@ -301,13 +291,53 @@ func GenerateReport(result *models.TestResult, reportDir string) (string, error)
 		fmt.Fprintf(file, "%s\n\n", threadActivityChartSVG)
 	}
 
-	// Incluir los gráficos de solicitudes y tiempos de respuesta en el reporte (embebidos)
-	fmt.Fprintf(file, "\n## Gráficos de Rendimiento\n\n")
-	fmt.Fprintf(file, "### Solicitudes por Segundo\n\n")
-	fmt.Fprintf(file, "%s\n\n", requestsChartSVG)
+	// Tabla comparativa de servicios
+	fmt.Fprintf(file, "\n### Tabla Comparativa de Servicios\n\n")
+	fmt.Fprintf(file, "| **Servicio** | **Peak de RPS** | **Tiempo máx** | **Tiempo min** | **Tiempo promedio** |\n")
+	fmt.Fprintf(file, "|-------------|---------------:|---------------:|--------------:|-------------------:|\n")
 
-	fmt.Fprintf(file, "### Tiempos de Respuesta\n\n")
-	fmt.Fprintf(file, "%s\n\n", responseTimesChartSVG)
+	// Ordenar los servicios por nombre para la tabla
+	var tableServiceNames []string
+	for name := range result.ServiceStats {
+		tableServiceNames = append(tableServiceNames, name)
+	}
+	sort.Strings(tableServiceNames)
+
+	// Llenar la tabla con datos de cada servicio
+	for _, name := range tableServiceNames {
+		stats := result.ServiceStats[name]
+
+		// Si el servicio tiene solicitudes, mostrar sus métricas
+		if stats.TotalRequests > 0 {
+			// Calcular RPS pico para este servicio
+			servicePeakRPS := 0.0
+			if len(result.ThreadActivity) > 0 {
+				// Usar proporción para estimar el RPS pico
+				proportion := 0.0
+				if result.TotalRequests > 0 {
+					proportion = float64(stats.TotalRequests) / float64(result.TotalRequests)
+				}
+
+				// Encontrar el RPS pico global
+				var globalPeakRPS float64
+				for _, activity := range result.ThreadActivity {
+					if activity.RequestsPS > globalPeakRPS {
+						globalPeakRPS = activity.RequestsPS
+					}
+				}
+
+				// Calcular el RPS pico estimado para este servicio
+				servicePeakRPS = globalPeakRPS * proportion
+			}
+
+			fmt.Fprintf(file, "| %s | %.2f | %s | %s | %s |\n",
+				stats.ServiceName,
+				servicePeakRPS,
+				FormatDuration(stats.MaxResponseTime),
+				FormatDuration(stats.MinResponseTime),
+				FormatDuration(stats.AvgResponseTime))
+		}
+	}
 
 	// Escribir las estadísticas por servicio
 	fmt.Fprintf(file, "\n## Estadísticas por Servicio\n\n")
@@ -318,6 +348,31 @@ func GenerateReport(result *models.TestResult, reportDir string) (string, error)
 		serviceNames = append(serviceNames, name)
 	}
 	sort.Strings(serviceNames)
+
+	// Calcular las tasas máximas de solicitudes por segundo
+	maxRPSByService := make(map[string]float64)
+
+	if len(result.ThreadActivity) > 0 {
+		// La tasa máxima general
+		var maxTotalRPS float64
+		for _, activity := range result.ThreadActivity {
+			if activity.RequestsPS > maxTotalRPS {
+				maxTotalRPS = activity.RequestsPS
+			}
+		}
+
+		// Distribuir la tasa máxima entre los servicios según su proporción
+		for _, name := range serviceNames {
+			stats := result.ServiceStats[name]
+			// Calcular la proporción de este servicio respecto al total
+			proportion := 0.0
+			if result.TotalRequests > 0 {
+				proportion = float64(stats.TotalRequests) / float64(result.TotalRequests)
+			}
+			// Asignar la parte proporcional del pico de RPS
+			maxRPSByService[name] = maxTotalRPS * proportion
+		}
+	}
 
 	for _, name := range serviceNames {
 		stats := result.ServiceStats[name]
@@ -331,7 +386,10 @@ func GenerateReport(result *models.TestResult, reportDir string) (string, error)
 			fmt.Fprintf(file, "- **Tiempo mínimo de respuesta:** %s\n", stats.MinResponseTime)
 			fmt.Fprintf(file, "- **Tiempo máximo de respuesta:** %s\n", stats.MaxResponseTime)
 			fmt.Fprintf(file, "- **Tiempo promedio de respuesta:** %s\n", stats.AvgResponseTime)
-			fmt.Fprintf(file, "- **Solicitudes por segundo:** %.2f\n", stats.RequestsPerSecond)
+
+			// Mostrar tanto el pico como el promedio de solicitudes por segundo
+			fmt.Fprintf(file, "- **Peak de solicitudes por segundo:** %.2f\n", maxRPSByService[name])
+			fmt.Fprintf(file, "- **Promedio de solicitudes por segundo:** %.2f\n", stats.RequestsPerSecond)
 
 			// Incluir los gráficos específicos del servicio (embebidos)
 			// Gráfico de tiempos

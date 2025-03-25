@@ -23,6 +23,9 @@ type Config struct {
 
 	// Configuración original para reportes (sin reemplazar variables)
 	OriginalConfig string
+
+	// Nuevo campo para el nombre del informe
+	ReportName string
 }
 
 // RunConfig representa la configuración de ejecución

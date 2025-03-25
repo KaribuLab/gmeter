@@ -64,6 +64,7 @@ Opciones disponibles:
 - `--log-max-backups`: Número máximo de archivos de respaldo (por defecto: 5)
 - `--log-max-age`: Días máximos para mantener los archivos de log (por defecto: 30)
 - `--log-compress`: Comprimir los archivos de log rotados (por defecto: true)
+- `--report-name`: Nombre personalizado para el archivo de reporte
 
 ## Archivo de Configuración
 
@@ -166,6 +167,7 @@ data_sources:
 
 - `log_file`: Ruta del archivo de log
 - `report_dir`: Directorio donde se generarán los reportes
+- `report_name`: Nombre personalizado para el archivo de reporte (opcional, por defecto usa un timestamp)
 
 #### Configuración de Ejecución
 

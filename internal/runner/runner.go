@@ -24,16 +24,15 @@ import (
 
 // Runner ejecuta pruebas de stress
 type Runner struct {
-	cfg             *config.Config
-	log             *logger.Logger
-	responseLog     *logger.Logger // Logger específico para las respuestas HTTP
-	client          *http.Client
-	variables       map[string]string     // Para almacenar variables extraídas entre solicitudes
-	mutex           sync.RWMutex          // Para acceso seguro a variables compartidas
-	activeThreads   int32                 // Contador atómico para el número de hilos activos
-	csvData         map[string][][]string // Datos cargados desde archivos CSV
-	csvHeaders      map[string][]string   // Encabezados de los archivos CSV
-	csvCurrentIndex int                   // Índice actual para los datos CSV
+	cfg           *config.Config
+	log           *logger.Logger
+	responseLog   *logger.Logger // Logger específico para las respuestas HTTP
+	client        *http.Client
+	variables     map[string]string     // Para almacenar variables extraídas entre solicitudes
+	mutex         sync.RWMutex          // Para acceso seguro a variables compartidas
+	activeThreads int32                 // Contador atómico para el número de hilos activos
+	csvData       map[string][][]string // Datos cargados desde archivos CSV
+	csvHeaders    map[string][]string   // Encabezados de los archivos CSV
 
 	// Variables para limitación de tasa
 	globalRateLimiter   *RateLimiter
@@ -264,6 +263,7 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	// Crear un contexto cancelable
 	ctx, cancel := context.WithCancel(ctx)
+	defer cancel() // Asegurar que se llame a cancel en todas las rutas de salida
 
 	// Parámetros de ejecución
 	var minThreads, maxThreads int
@@ -309,11 +309,11 @@ func (r *Runner) Run(ctx context.Context) error {
 		rampUp = 0 // Sin rampa por defecto
 	}
 
-	r.log.Info(fmt.Sprintf("Iniciando prueba de stress con configuración:"))
-	r.log.Info(fmt.Sprintf("- Hilos mínimos: %d", minThreads))
-	r.log.Info(fmt.Sprintf("- Hilos máximos: %d", maxThreads))
-	r.log.Info(fmt.Sprintf("- Duración: %s", duration))
-	r.log.Info(fmt.Sprintf("- Tiempo de rampa: %s", rampUp))
+	r.log.Info("Iniciando prueba de stress con configuración:")
+	r.log.Info("- Hilos mínimos:", minThreads)
+	r.log.Info("- Hilos máximos:", maxThreads)
+	r.log.Info("- Duración:", duration)
+	r.log.Info("- Tiempo de rampa:", rampUp)
 
 	startTime := time.Now()
 	endTime := startTime.Add(duration)
@@ -617,7 +617,7 @@ mainLoop:
 	// Generar el reporte
 	if r.cfg.ReportDir != "" {
 		r.log.Info(fmt.Sprintf("Generando reporte en %s...", r.cfg.ReportDir))
-		reportPath, err := reporter.GenerateReport(r.testResult, r.cfg.ReportDir)
+		reportPath, err := reporter.GenerateReport(r.testResult, r.cfg.ReportDir, r.cfg.ReportName)
 		if err != nil {
 			r.log.Error(fmt.Sprintf("Error al generar el reporte: %s", err.Error()))
 		} else {
@@ -727,7 +727,13 @@ func (r *Runner) executeThread(ctx context.Context, threadNum int) {
 			executedServices[service.Name] = true
 
 			// Registrar el resultado exitoso
-			r.registerServiceResult(service.Name, result.statusCode, result.responseTime, "", threadNum)
+			statusCode := 0
+			responseTime := time.Duration(0)
+			if result != nil {
+				statusCode = result.statusCode
+				responseTime = result.responseTime
+			}
+			r.registerServiceResult(service.Name, statusCode, responseTime, "", threadNum)
 
 			// Si el servicio extrajo variables, actualizar el mapa de variables del hilo
 			if result != nil && len(result.extractedVars) > 0 {

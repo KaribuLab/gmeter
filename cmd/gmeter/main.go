@@ -20,6 +20,7 @@ var (
 	logMaxBackups int
 	logMaxAge     int
 	logCompress   bool
+	reportName    string
 )
 
 func init() {
@@ -43,6 +44,11 @@ Permite configurar múltiples servicios, hilos por segundo, y generar reportes d
 				return fmt.Errorf("error al cargar la configuración: %w", err)
 			}
 			log.Info("Configuración cargada correctamente")
+
+			// Asignar nombre del reporte si se especificó por línea de comandos
+			if reportName != "" {
+				cfg.ReportName = reportName
+			}
 
 			// Configurar el logger para archivo si es necesario
 			if cfg.LogFile != "" {
@@ -80,6 +86,7 @@ Permite configurar múltiples servicios, hilos por segundo, y generar reportes d
 	rootCmd.PersistentFlags().IntVar(&logMaxBackups, "log-max-backups", 5, "número máximo de archivos de respaldo")
 	rootCmd.PersistentFlags().IntVar(&logMaxAge, "log-max-age", 30, "días máximos para mantener los archivos de log")
 	rootCmd.PersistentFlags().BoolVar(&logCompress, "log-compress", true, "comprimir los archivos de log rotados")
+	rootCmd.PersistentFlags().StringVar(&reportName, "report-name", "", "nombre personalizado para el archivo de reporte")
 
 	if err := rootCmd.Execute(); err != nil {
 		log.WithError(err).Fatal("Error al ejecutar el comando")

@@ -2,6 +2,7 @@
 log_file: "gmeter.log"
 response_log_file: "gmeter_responses.log" # Archivo separado para guardar las respuestas HTTP completas
 report_dir: "reports"
+report_name: "stress_test_report" # Nombre personalizado para el archivo de reporte (opcional)
 
 # Configuración global
 global:

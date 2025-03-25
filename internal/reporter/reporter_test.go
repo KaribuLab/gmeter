@@ -117,7 +117,7 @@ func TestGenerateReport(t *testing.T) {
 	}
 
 	// Generar el reporte
-	reportPath, err := GenerateReport(result, tempDir)
+	reportPath, err := GenerateReport(result, tempDir, "")
 	require.NoError(t, err, "Error al generar el reporte")
 
 	// Verificar que el reporte se ha generado correctamente
@@ -136,6 +136,32 @@ func TestGenerateReport(t *testing.T) {
 	assert.Contains(t, contentStr, "### service1", "El reporte no contiene las estadísticas del servicio 1")
 	assert.Contains(t, contentStr, "### service2", "El reporte no contiene las estadísticas del servicio 2")
 	assert.Contains(t, contentStr, "## Configuración", "El reporte no contiene la sección de configuración")
+}
+
+func TestGenerateReportWithCustomName(t *testing.T) {
+	// Crear un directorio temporal para las pruebas
+	tempDir := t.TempDir()
+
+	// Crear un resultado de prueba básico
+	result := &models.TestResult{
+		StartTime:     time.Now().Add(-1 * time.Hour),
+		EndTime:       time.Now(),
+		TotalRequests: 100,
+	}
+
+	// Nombre personalizado para el reporte
+	customName := "reporte_personalizado"
+
+	// Generar el reporte con nombre personalizado
+	reportPath, err := GenerateReport(result, tempDir, customName)
+	require.NoError(t, err, "Error al generar el reporte con nombre personalizado")
+
+	// Verificar que el reporte tiene el nombre esperado
+	expectedName := customName + ".md"
+	assert.Equal(t, expectedName, filepath.Base(reportPath), "El nombre del reporte no coincide con el esperado")
+
+	// Verificar que el archivo existe
+	assert.FileExists(t, reportPath, "El archivo de reporte personalizado no existe")
 }
 
 func TestGenerateCharts(t *testing.T) {
